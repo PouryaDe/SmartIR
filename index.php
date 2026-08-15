@@ -32,18 +32,32 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
  * Fetches JSON data from a given API URL with a 5-minute file-based cache.
  *
  * @param string $apiUrl    The full URL of the API endpoint.
- * @param string $userAgent The client User-Agent to forward to the API.
  * @return array|null Returns decoded array on success, or null on failure.
  */
-function fetchJsonFromUrl(string $apiUrl, string $userAgent): ?array
+function fetchJsonFromUrl(string $apiUrl): ?array
 {
-    $cacheFile    = __DIR__ . '/cache/' . hash('sha256', $apiUrl) . '.json';
+    $userAgent    = str_replace(["\r", "\n"], '', $_SERVER['HTTP_USER_AGENT'] ?? 'PHP-API-Client');
+    $cacheDir     = __DIR__ . '/cache/';
+    $cacheFile    = $cacheDir . hash('sha256', $apiUrl) . '_v2.json';
     $cacheLifetime = 300; // 5 minutes
 
+    // Garbage Collection: Clean up expired cache files (5% probability to avoid performance issues)
+    if (rand(1, 20) === 1) {
+        $files = glob($cacheDir . '*.json');
+        if ($files) {
+            $now = time();
+            foreach ($files as $file) {
+                if (is_file($file) && ($now - filemtime($file)) >= $cacheLifetime) {
+                    @unlink($file);
+                }
+            }
+        }
+    }
+
     if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < $cacheLifetime) {
-        $data = json_decode(file_get_contents($cacheFile), true);
-        if (json_last_error() === JSON_ERROR_NONE) {
-            return $data;
+        $cached = json_decode(file_get_contents($cacheFile), true);
+        if (json_last_error() === JSON_ERROR_NONE && isset($cached['headers'], $cached['body'])) {
+            return $cached;
         }
     }
 
@@ -51,6 +65,17 @@ function fetchJsonFromUrl(string $apiUrl, string $userAgent): ?array
     if ($ch === false) {
         return null;
     }
+
+    $responseHeaders = [];
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION, function($curl, $header) use (&$responseHeaders) {
+        $len = strlen($header);
+        $parts = explode(':', $header, 2);
+        if (count($parts) === 2) {
+            $name = strtolower(trim($parts[0]));
+            $responseHeaders[$name][] = trim($parts[1]);
+        }
+        return $len;
+    });
 
     curl_setopt($ch, CURLOPT_URL, $apiUrl);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -83,74 +108,21 @@ function fetchJsonFromUrl(string $apiUrl, string $userAgent): ?array
     if ($httpCode === 200 && $response) {
         $data = json_decode($response, true);
         if (json_last_error() === JSON_ERROR_NONE) {
-            file_put_contents($cacheFile, $response, LOCK_EX);
-            return $data;
+            $result = [
+                'headers' => $responseHeaders,
+                'body'    => $data
+            ];
+            file_put_contents($cacheFile, json_encode($result), LOCK_EX);
+            return $result;
         }
     }
 
     return null;
 }
 
-/**
- * Parses the User-Agent string to identify known VPN and proxy clients.
- *
- * @param string $uaRaw The raw User-Agent string.
- * @return array Information about the parsed User-Agent.
- */
-function parseUserAgent(string $uaRaw): array
-{
-    // Truncate first, then lowercase — avoids running strtolower on a large string
-    $uaRaw = strtolower(substr($uaRaw, 0, 255));
-    preg_match('/(?<name>[a-z0-9\-]{1,20})[\/\s;]+(?<ver>[\d\.]{1,20})/', $uaRaw, $m);
 
-    $appName = $m['name'] ?? '';
-    $appVer  = $m['ver']  ?? '';
 
-    $validApps = [
-        'streisand', 'v2rayng', 'happ', 'v2box', 'hiddifynext', 'hiddifynextx',
-        'v2raytun', 'hiddifyng', 'shadowrocket', 'v2rayn', 'pc', 'karing', 'foxray',
-    ];
 
-    $blackApps = [
-        'facebookexternalhit', 'linkedinbot', 'reactornetty', 'dalvik',
-        'postmanruntime', 'dart', 'botim', 'freevpn', 'googlebot-image',
-        'curl', 'unityplayer', 'trafilatura', 'v2rayx', 'sfa', 'sfi',
-        'go-http-client', 'v2rayf', 'v2rayagn', '20vpn', 'stash',
-        '20connect', 'quot', 'okhttp', 'googlemessages', 'bitlybot', 'instagram',
-    ];
-
-    return [
-        'raw'      => $uaRaw,
-        'name'     => $appName,
-        'version'  => $appVer,
-        'is_valid' => $appName && in_array($appName, $validApps, true),
-        'is_black' => $appName && in_array($appName, $blackApps, true),
-    ];
-}
-
-/**
- * Sets the necessary HTTP headers for subscription clients.
- *
- * @param array $apiResult The decoded API response.
- */
-function buildSubscriptionHeaders(array $apiResult): void
-{
-    $usageTotal    = $apiResult['usage']['total']        ?? 0;
-    $usageUpload   = $apiResult['usage']['upload']       ?? 0;
-    $usageDownload = $apiResult['usage']['download']     ?? 0;
-    $expireAt      = $apiResult['expire_at']             ?? 0;
-    $brand         = $apiResult['creator_data']['brand'] ?? $apiResult['remark'] ?? '';
-
-    header('Content-Type: text/plain; charset=UTF-8');
-    header("subscription-userinfo: upload={$usageUpload}; download={$usageDownload}; total={$usageTotal}; expire={$expireAt}");
-    header('profile-title: base64:' . base64_encode((string) $brand));
-    header('profile-update-interval: 2');
-
-    if (!empty($apiResult['creator_data']['notice'])) {
-        $noticeString = str_replace(["\r", "\n"], ' ', trim($apiResult['creator_data']['notice']));
-        header("announce: {$noticeString}");
-    }
-}
 
 /**
  * Renders the HTML redirect page for browser/non-API clients.
@@ -193,20 +165,30 @@ HTML;
  */
 function processSubscription(string $url, string $apiUrl): void
 {
-    $userAgent = str_replace(["\r", "\n"], '', $_SERVER['HTTP_USER_AGENT'] ?? 'PHP-API-Client');
-    $ua        = parseUserAgent($userAgent);
-    $apiResult = fetchJsonFromUrl($apiUrl, $userAgent);
+    $apiResult = fetchJsonFromUrl($apiUrl);
 
-    if ($apiResult !== null && $ua['is_valid']) {
-        // Valid VPN client: send headers and config, then stop
-        buildSubscriptionHeaders($apiResult);
-        echo (string) ($apiResult['configs'] ?? '');
+    if ($apiResult !== null && !empty($apiResult['body']['is_valid'])) {
+        // Valid VPN client: send specific allowed headers from API
+        $allowedHeaders = [
+            'subscription-userinfo', 'profile-title', 'profile-update-interval', 
+            'announce', 'support-url', 'profile-web-page-url'
+        ];
+        header('Content-Type: text/plain; charset=UTF-8');
+        foreach ($allowedHeaders as $h) {
+            if (!empty($apiResult['headers'][$h])) {
+                foreach ($apiResult['headers'][$h] as $val) {
+                    header("$h: $val");
+                }
+            }
+        }
+        
+        // Output configs
+        echo (string) ($apiResult['body']['configs'] ?? '');
         return;
     }
 
     // Browser or unknown client: render HTML redirect page
-    $finalConfig = $apiResult !== null ? (string) ($apiResult['configs'] ?? '') : '';
-    renderHtmlRedirect($url, $finalConfig);
+    renderHtmlRedirect($url, '');
 }
 
 // ==========================================
