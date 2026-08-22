@@ -182,8 +182,15 @@ function processSubscription(string $url, string $apiUrl): void
             }
         }
         
-        // Output configs
-        echo (string) ($apiResult['body']['configs'] ?? '');
+        // Output configs (Base64 encoded for better compatibility with VPN clients)
+        $configs = (string) ($apiResult['body']['configs'] ?? '');
+        
+        // Encode to base64 if it's in plain text (contains protocol like vless://)
+        if (strpos($configs, '://') !== false) {
+            echo base64_encode($configs);
+        } else {
+            echo $configs;
+        }
         return;
     }
 
