@@ -195,7 +195,8 @@ function processSubscription(string $url, string $apiUrl): void
     }
 
     // Browser or unknown client: render HTML redirect page
-    renderHtmlRedirect($url, '');
+    $fallbackConfigs = (string) ($apiResult['body']['configs'] ?? '');
+    renderHtmlRedirect($url, $fallbackConfigs);
 }
 
 // ==========================================
