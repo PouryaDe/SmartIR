@@ -1,0 +1,12 @@
+Help.txt
+nginx.txt
+error.log
+config.php
+cache/
+vendor/
+.phpunit.cache/
+.vscode/
+tests/
+composer.json
+composer.lock
+phpunit.xml
