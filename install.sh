@@ -193,6 +193,7 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
     server_name $DOMAIN;
+    charset utf-8;
     
     root $DOC_ROOT;
     index index.php index.html index.htm index.nginx-debian.html;

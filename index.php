@@ -15,6 +15,15 @@ ini_set('log_errors', '1');
 ini_set('error_log', __DIR__ . '/error.log');
 error_reporting(E_ALL);
 
+// Ensure full UTF-8 encoding across all string and I/O operations
+ini_set('default_charset', 'UTF-8');
+if (function_exists('mb_internal_encoding')) {
+    mb_internal_encoding('UTF-8');
+}
+if (function_exists('mb_http_output')) {
+    mb_http_output('UTF-8');
+}
+
 date_default_timezone_set('Asia/Tehran');
 
 // Reject non-GET requests immediately
@@ -79,7 +88,12 @@ function fetchJsonFromUrl(string $apiUrl): ?array
         $parts = explode(':', $header, 2);
         if (count($parts) === 2) {
             $name = strtolower(trim($parts[0]));
-            $responseHeaders[$name][] = trim($parts[1]);
+            $val  = trim($parts[1]);
+            // Ensure header value is clean UTF-8
+            if (!mb_check_encoding($val, 'UTF-8')) {
+                $val = mb_convert_encoding($val, 'UTF-8', 'ISO-8859-1');
+            }
+            $responseHeaders[$name][] = $val;
         }
         return $len;
     });
@@ -91,11 +105,14 @@ function fetchJsonFromUrl(string $apiUrl): ?array
     curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
     curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
     curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+    curl_setopt($ch, CURLOPT_ENCODING, ''); // Enable transparent decompression (gzip, deflate)
+
     // Sanitize HTTP_ACCEPT to prevent CRLF injection
     $acceptHeader = str_replace(["\r", "\n"], '', $_SERVER['HTTP_ACCEPT'] ?? 'application/json');
 
     curl_setopt($ch, CURLOPT_HTTPHEADER, [
         'Accept: ' . $acceptHeader,
+        'Accept-Charset: utf-8',
         'User-Agent: ' . $userAgent,
     ]);
 
@@ -121,6 +138,14 @@ function fetchJsonFromUrl(string $apiUrl): ?array
     curl_close($ch);
 
     if ($httpCode === 200 && $response) {
+        // Strip UTF-8 BOM if present
+        if (str_starts_with($response, "\xEF\xBB\xBF")) {
+            $response = substr($response, 3);
+        }
+        if (!mb_check_encoding($response, 'UTF-8')) {
+            $response = mb_convert_encoding($response, 'UTF-8', 'auto');
+        }
+
         $data = json_decode($response, true);
         if (json_last_error() === JSON_ERROR_NONE) {
             $result = [
@@ -130,7 +155,10 @@ function fetchJsonFromUrl(string $apiUrl): ?array
             if (!is_dir($cacheDir)) {
                 @mkdir($cacheDir, 0775, true);
             }
-            file_put_contents($cacheFile, json_encode($result), LOCK_EX);
+            $encoded = json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            if ($encoded !== false) {
+                file_put_contents($cacheFile, $encoded, LOCK_EX);
+            }
             return $result;
         }
     }
@@ -138,9 +166,125 @@ function fetchJsonFromUrl(string $apiUrl): ?array
     return null;
 }
 
+/**
+ * Formats subscription header values to ensure Persian and Unicode characters
+ * are never corrupted to '??????' across any VPN client or HTTP library.
+ *
+ * @param string $headerName Lowercase header name.
+ * @param string $headerValue Raw header value.
+ * @return array<string, string> Associative array of header_name => header_value.
+ */
+function formatSubscriptionHeader(string $headerName, string $headerValue): array
+{
+    // Sanitize header value against CRLF injection / HTTP response splitting
+    $headerValue = str_replace(["\r", "\n"], '', trim($headerValue));
+    if ($headerValue === '') {
+        return [];
+    }
 
+    $headers = [];
 
+    if ($headerName === 'profile-title' || $headerName === 'announce') {
+        if (str_starts_with($headerValue, 'base64:')) {
+            // Already standard base64: format
+            $headers[$headerName] = $headerValue;
+            $rawText = base64_decode(substr($headerValue, 7), true);
+            if ($rawText !== false && $rawText !== '') {
+                $headers[$headerName . '*'] = "UTF-8''" . rawurlencode($rawText);
+            }
+        } elseif (preg_match('/[^\x20-\x7E]/', $headerValue)) {
+            // Contains non-ASCII (Persian / Unicode). Encode to base64: and RFC 8187
+            $headers[$headerName] = 'base64:' . base64_encode($headerValue);
+            $headers[$headerName . '*'] = "UTF-8''" . rawurlencode($headerValue);
+        } elseif (strpos($headerValue, '%') !== false && ($decoded = rawurldecode($headerValue)) !== $headerValue && preg_match('/[^\x20-\x7E]/', $decoded)) {
+            // Was percent-encoded Persian/Unicode text
+            $headers[$headerName] = 'base64:' . base64_encode($decoded);
+            $headers[$headerName . '*'] = "UTF-8''" . rawurlencode($decoded);
+        } else {
+            // Standard ASCII text
+            $headers[$headerName] = $headerValue;
+        }
+    } elseif ($headerName === 'support-url' || $headerName === 'profile-web-page-url') {
+        // Encode non-ASCII characters in URLs to prevent HTTP header corruption
+        if (preg_match('/[^\x20-\x7E]/', $headerValue)) {
+            $headerValue = preg_replace_callback('/[^\x20-\x7E]+/', function ($matches) {
+                return rawurlencode($matches[0]);
+            }, $headerValue);
+        }
+        $headers[$headerName] = $headerValue;
+    } else {
+        $headers[$headerName] = $headerValue;
+    }
 
+    return $headers;
+}
+
+/**
+ * Normalizes subscription configs to ensure Persian/Unicode remarks (#...)
+ * in protocol links (vless, vmess, trojan, ss, etc.) are safe for Java/Android
+ * and all client URI parsers without turning into '??????'.
+ *
+ * @param string $configs Raw subscription configs (plaintext or base64).
+ * @return string Normalized configs (base64 encoded for VPN client compatibility).
+ */
+function normalizeConfigs(string $configs): string
+{
+    $configs = trim($configs);
+    if ($configs === '') {
+        return '';
+    }
+
+    $isBase64 = false;
+    // Check if configs is already base64 encoded
+    if (strpos($configs, '://') === false && preg_match('/^[A-Za-z0-9+\/=\r\n]+$/', $configs)) {
+        $decoded = base64_decode($configs, true);
+        if ($decoded !== false && (strpos($decoded, '://') !== false || strpos($decoded, "\n") !== false)) {
+            $configs = $decoded;
+            $isBase64 = true;
+        }
+    }
+
+    // Preserve Clash YAML or Sing-box JSON intact
+    $trimmed = ltrim($configs);
+    if (str_starts_with($trimmed, '{') || str_starts_with($trimmed, 'proxies:') || str_starts_with($trimmed, 'port:')) {
+        return $isBase64 ? base64_encode($configs) : $configs;
+    }
+
+    $lines = preg_split('/\r\n|\r|\n/', $configs);
+    $normalizedLines = [];
+
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '') {
+            continue;
+        }
+
+        // Check if this line is a URI with a fragment (#remark)
+        if (strpos($line, '://') !== false && strpos($line, '#') !== false) {
+            $parts = explode('#', $line, 2);
+            $uriPart = $parts[0];
+            $remark = $parts[1] ?? '';
+
+            // If remark contains raw non-ASCII characters (e.g. Persian/Arabic/Unicode)
+            if ($remark !== '' && preg_match('/[^\x20-\x7E]/', $remark)) {
+                $decoded = rawurldecode($remark);
+                $remark = rawurlencode($decoded);
+            }
+            $line = $uriPart . '#' . $remark;
+        }
+
+        $normalizedLines[] = $line;
+    }
+
+    $result = implode("\n", $normalizedLines);
+
+    // If it contains protocol URIs or was originally base64, return base64
+    if ($isBase64 || strpos($result, '://') !== false) {
+        return base64_encode($result);
+    }
+
+    return $result;
+}
 
 /**
  * Renders the HTML redirect page for browser/non-API clients.
@@ -150,7 +294,9 @@ function fetchJsonFromUrl(string $apiUrl): ?array
  */
 function renderHtmlRedirect(string $url, string $finalConfig): void
 {
-    $jsUrl   = json_encode($url, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP);
+    header('Content-Type: text/html; charset=UTF-8');
+
+    $jsUrl   = json_encode($url, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP);
     $htmlUrl = htmlspecialchars($url, ENT_QUOTES, 'UTF-8');
 
     echo <<<HTML
@@ -159,7 +305,7 @@ function renderHtmlRedirect(string $url, string $finalConfig): void
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Redirecting...</title>
+    <title>در حال انتقال...</title>
     <meta http-equiv="refresh" content="0;url={$htmlUrl}">
     <style>
         html, body { display: none; visibility: hidden; }
@@ -174,7 +320,7 @@ function renderHtmlRedirect(string $url, string $finalConfig): void
 HTML;
 
     if ($finalConfig !== '') {
-        echo "\n<!--\n" . base64_encode($finalConfig) . "\n-->\n";
+        echo "\n<!--\n" . normalizeConfigs($finalConfig) . "\n-->\n";
     }
 }
 
@@ -198,22 +344,17 @@ function processSubscription(string $url, string $apiUrl): void
         foreach ($allowedHeaders as $h) {
             if (!empty($apiResult['headers'][$h])) {
                 foreach ($apiResult['headers'][$h] as $val) {
-                    // Sanitize header value to prevent HTTP Response Splitting
-                    $val = str_replace(["\r", "\n"], '', $val);
-                    header("$h: $val", false);
+                    $formattedHeaders = formatSubscriptionHeader($h, $val);
+                    foreach ($formattedHeaders as $headerKey => $headerVal) {
+                        header("{$headerKey}: {$headerVal}", false);
+                    }
                 }
             }
         }
         
-        // Output configs (Base64 encoded for better compatibility with VPN clients)
+        // Output configs (properly normalized and Base64 encoded for VPN clients)
         $configs = (string) ($apiResult['body']['configs'] ?? '');
-        
-        // Encode to base64 if it's in plain text (contains protocol like vless://)
-        if (strpos($configs, '://') !== false) {
-            echo base64_encode($configs);
-        } else {
-            echo $configs;
-        }
+        echo normalizeConfigs($configs);
         return;
     }
 
@@ -227,8 +368,10 @@ function processSubscription(string $url, string $apiUrl): void
 // ==========================================
 
 Route::add('/([\d\w\-]+)', function ($smartlink_id) {
-    $url    = 'https://' . API_DOMAIN . "/{$smartlink_id}/";
-    $apiUrl = 'https://' . API_DOMAIN . "/api/{$smartlink_id}/";
+    $queryString = str_replace(["\r", "\n"], '', $_SERVER['QUERY_STRING'] ?? '');
+    $query  = $queryString !== '' ? '?' . $queryString : '';
+    $url    = 'https://' . API_DOMAIN . "/{$smartlink_id}/" . $query;
+    $apiUrl = 'https://' . API_DOMAIN . "/api/{$smartlink_id}/" . $query;
     processSubscription($url, $apiUrl);
 });
 
