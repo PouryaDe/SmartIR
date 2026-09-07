@@ -182,6 +182,7 @@ function formatSubscriptionHeader(string $headerName, string $headerValue): arra
         return [];
     }
 
+    $headerName = strtolower(trim($headerName));
     $headers = [];
 
     if ($headerName === 'profile-title' || $headerName === 'announce') {
@@ -369,6 +370,11 @@ function processSubscription(string $url, string $apiUrl): void
 
 Route::add('/([\d\w\-]+)', function ($smartlink_id) {
     $queryString = str_replace(["\r", "\n"], '', $_SERVER['QUERY_STRING'] ?? '');
+    if ($queryString !== '') {
+        $queryString = preg_replace_callback('/[^\x21-\x7E]+/', function ($matches) {
+            return rawurlencode($matches[0]);
+        }, $queryString);
+    }
     $query  = $queryString !== '' ? '?' . $queryString : '';
     $url    = 'https://' . API_DOMAIN . "/{$smartlink_id}/" . $query;
     $apiUrl = 'https://' . API_DOMAIN . "/api/{$smartlink_id}/" . $query;
