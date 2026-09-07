@@ -105,7 +105,6 @@ function fetchJsonFromUrl(string $apiUrl): ?array
     curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
     curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
     curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-    curl_setopt($ch, CURLOPT_ENCODING, ''); // Enable transparent decompression (gzip, deflate)
 
     // Sanitize HTTP_ACCEPT to prevent CRLF injection
     $acceptHeader = str_replace(["\r", "\n"], '', $_SERVER['HTTP_ACCEPT'] ?? 'application/json');
