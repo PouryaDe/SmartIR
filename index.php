@@ -77,88 +77,90 @@ function fetchJsonFromUrl(string $apiUrl): ?array
         }
     }
 
-    $ch = curl_init();
-    if ($ch === false) {
-        return null;
-    }
-
-    $responseHeaders = [];
-    curl_setopt($ch, CURLOPT_HEADERFUNCTION, function($curl, $header) use (&$responseHeaders) {
-        $len = strlen($header);
-        $parts = explode(':', $header, 2);
-        if (count($parts) === 2) {
-            $name = strtolower(trim($parts[0]));
-            $val  = trim($parts[1]);
-            // Ensure header value is clean UTF-8
-            if (!mb_check_encoding($val, 'UTF-8')) {
-                $val = mb_convert_encoding($val, 'UTF-8', 'ISO-8859-1');
-            }
-            $responseHeaders[$name][] = $val;
-        }
-        return $len;
-    });
-
-    curl_setopt($ch, CURLOPT_URL, $apiUrl);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-
-    // Sanitize HTTP_ACCEPT to prevent CRLF injection
+    $proxyUrl     = defined('PROXY_URL') ? trim(PROXY_URL) : '';
     $acceptHeader = str_replace(["\r", "\n"], '', $_SERVER['HTTP_ACCEPT'] ?? 'application/json');
 
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Accept: ' . $acceptHeader,
-        'Accept-Charset: utf-8',
-        'User-Agent: ' . $userAgent,
-    ]);
+    // If proxy is set, let proxy handle routing; otherwise prefer IPv6 first (critical for Iranian networks & bypassing Cloudflare/origin IPv4 bans),
+    // and fallback to IPv4 if IPv6 fails or is unavailable.
+    $ipResolveAttempts = ($proxyUrl !== '')
+        ? [CURL_IPRESOLVE_WHATEVER]
+        : [CURL_IPRESOLVE_V6, CURL_IPRESOLVE_V4];
 
-    // Apply proxy if configured (supports SOCKS5 and HTTP/HTTPS)
-    $proxyUrl = defined('PROXY_URL') ? trim(PROXY_URL) : '';
-    if ($proxyUrl !== '') {
-        curl_setopt($ch, CURLOPT_PROXY, $proxyUrl);
-        if (stripos($proxyUrl, 'socks5') === 0) {
-            curl_setopt($ch, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5_HOSTNAME);
-        } elseif (stripos($proxyUrl, 'http') === 0) {
-            curl_setopt($ch, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+    foreach ($ipResolveAttempts as $ipResolve) {
+        $ch = curl_init();
+        if ($ch === false) {
+            continue;
         }
-    }
 
-    $response = curl_exec($ch);
+        $responseHeaders = [];
+        curl_setopt($ch, CURLOPT_HEADERFUNCTION, function($curl, $header) use (&$responseHeaders) {
+            $len = strlen($header);
+            $parts = explode(':', $header, 2);
+            if (count($parts) === 2) {
+                $name = strtolower(trim($parts[0]));
+                $val  = trim($parts[1]);
+                // Ensure header value is clean UTF-8
+                if (!mb_check_encoding($val, 'UTF-8')) {
+                    $val = mb_convert_encoding($val, 'UTF-8', 'ISO-8859-1');
+                }
+                $responseHeaders[$name][] = $val;
+            }
+            return $len;
+        });
 
-    if (curl_errno($ch)) {
+        curl_setopt($ch, CURLOPT_URL, $apiUrl);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_IPRESOLVE, $ipResolve);
+
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Accept: ' . $acceptHeader,
+            'Accept-Charset: utf-8',
+            'User-Agent: ' . $userAgent,
+        ]);
+
+        if ($proxyUrl !== '') {
+            curl_setopt($ch, CURLOPT_PROXY, $proxyUrl);
+            if (stripos($proxyUrl, 'socks5') === 0) {
+                curl_setopt($ch, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5_HOSTNAME);
+            } elseif (stripos($proxyUrl, 'http') === 0) {
+                curl_setopt($ch, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+            }
+        }
+
+        $response = curl_exec($ch);
+        $errno    = curl_errno($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        return null;
-    }
 
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($httpCode === 200 && $response) {
-        // Strip UTF-8 BOM if present
-        if (str_starts_with($response, "\xEF\xBB\xBF")) {
-            $response = substr($response, 3);
-        }
-        if (!mb_check_encoding($response, 'UTF-8')) {
-            $response = mb_convert_encoding($response, 'UTF-8', 'auto');
-        }
-
-        $data = json_decode($response, true);
-        if (json_last_error() === JSON_ERROR_NONE) {
-            $result = [
-                'headers' => $responseHeaders,
-                'body'    => $data
-            ];
-            if (!is_dir($cacheDir)) {
-                @mkdir($cacheDir, 0775, true);
+        if (!$errno && $httpCode === 200 && $response) {
+            // Strip UTF-8 BOM if present
+            if (str_starts_with($response, "\xEF\xBB\xBF")) {
+                $response = substr($response, 3);
             }
-            $encoded = json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-            if ($encoded !== false) {
-                file_put_contents($cacheFile, $encoded, LOCK_EX);
+            if (!mb_check_encoding($response, 'UTF-8')) {
+                $response = mb_convert_encoding($response, 'UTF-8', 'auto');
             }
-            return $result;
+
+            $data = json_decode($response, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $result = [
+                    'headers' => $responseHeaders,
+                    'body'    => $data
+                ];
+                if (!is_dir($cacheDir)) {
+                    @mkdir($cacheDir, 0775, true);
+                }
+                $encoded = json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                if ($encoded !== false) {
+                    file_put_contents($cacheFile, $encoded, LOCK_EX);
+                }
+                return $result;
+            }
         }
     }
 

@@ -64,8 +64,15 @@ function install_prerequisites() {
 
     systemctl enable php8.1-fpm --now
 
-
-
+    print_msg "Ensuring IPv6 is enabled for optimal international connectivity..."
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+    cat > /etc/sysctl.d/99-smartlink.conf <<EOF
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
+EOF
+    sysctl -p /etc/sysctl.d/99-smartlink.conf >/dev/null 2>&1
     print_msg "Optimizing Nginx and PHP-FPM settings based on server resources..."
     CPU_CORES=$(nproc)
     TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
