@@ -41,17 +41,107 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
 // ==========================================
 
 /**
- * Fetches JSON data from a given API URL with a 5-minute file-based cache.
+ * Safely resolves the client's real IP address.
+ * Prioritizes Cloudflare connecting IP and public socket address (REMOTE_ADDR)
+ * to prevent client-side IP spoofing via X-Forwarded-For.
  *
- * @param string $apiUrl    The full URL of the API endpoint.
+ * @return string Validated IP address, or empty string if undetermined.
+ */
+function getClientIp(): string
+{
+    // If request passed through Cloudflare reverse proxy
+    if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+        $cfIp = trim(explode(',', (string) $_SERVER['HTTP_CF_CONNECTING_IP'])[0]);
+        if (filter_var($cfIp, FILTER_VALIDATE_IP)) {
+            return $cfIp;
+        }
+    }
+
+    $remoteAddr = str_replace(["\r", "\n"], '', $_SERVER['REMOTE_ADDR'] ?? '');
+    if ($remoteAddr !== '') {
+        // If REMOTE_ADDR is a public IP, prioritize it over client-supplied headers
+        if (filter_var($remoteAddr, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+            return $remoteAddr;
+        }
+
+        // Server is behind an internal reverse proxy / local gateway (e.g. Docker, HAProxy)
+        if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+            $forwardedIps = explode(',', (string) $_SERVER['HTTP_X_FORWARDED_FOR']);
+            foreach ($forwardedIps as $candidateIp) {
+                $candidateIp = trim($candidateIp);
+                if (filter_var($candidateIp, FILTER_VALIDATE_IP)) {
+                    return $candidateIp;
+                }
+            }
+        }
+
+        // Fallback to REMOTE_ADDR (even if private) if no forwarded IP was found
+        if (filter_var($remoteAddr, FILTER_VALIDATE_IP)) {
+            return $remoteAddr;
+        }
+    }
+
+    return '';
+}
+
+/**
+ * Determines whether a given User-Agent belongs to a known VPN client/app.
+ *
+ * @param string $userAgent Raw User-Agent string.
+ * @return bool True if recognized as a VPN client.
+ */
+function isVpnClient(string $userAgent): bool
+{
+    $ua = strtolower($userAgent);
+    $clients = [
+        'happ', 'streisand', 'v2ray', 'clash', 'mihomo', 'sing-box',
+        'singbox', 'hiddify', 'shadowrocket', 'karing', 'foxray',
+        'nekobox', 'nekoray', 'v2box', 'stash', 'loon', 'quantumult', 'surge'
+    ];
+
+    foreach ($clients as $client) {
+        if (str_contains($ua, $client)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Determines whether the incoming request originates from a standard web browser.
+ *
+ * @param string $userAgent    Client User-Agent header.
+ * @param string $acceptHeader Client Accept header.
+ * @return bool True if the client is a genuine web browser.
+ */
+function isWebBrowser(string $userAgent, string $acceptHeader): bool
+{
+    if (isVpnClient($userAgent)) {
+        return false;
+    }
+
+    $ua     = strtolower($userAgent);
+    $accept = strtolower($acceptHeader);
+
+    return str_contains($accept, 'text/html') ||
+        (str_contains($ua, 'mozilla') && !str_contains($accept, 'application/json'));
+}
+
+/**
+ * Fetches JSON data from a given API URL with a 5-minute file-based cache and optional stale fallback.
+ *
+ * @param string $apiUrl               The full URL of the API endpoint.
+ * @param bool   $allowStaleOnFailure  If true, returns stale cached data (up to 24h old) on network/server failures.
  * @return array|null Returns decoded array on success, or null on failure.
  */
-function fetchJsonFromUrl(string $apiUrl): ?array
+function fetchJsonFromUrl(string $apiUrl, bool $allowStaleOnFailure = false): ?array
 {
-    $userAgent    = str_replace(["\r", "\n"], '', $_SERVER['HTTP_USER_AGENT'] ?? 'PHP-API-Client');
-    $cacheDir     = __DIR__ . '/cache/';
-    $cacheFile    = $cacheDir . hash('sha256', $apiUrl . '_' . $userAgent) . '_v2.json';
-    $cacheLifetime = 300; // 5 minutes
+    $userAgent     = str_replace(["\r", "\n"], '', $_SERVER['HTTP_USER_AGENT'] ?? 'PHP-API-Client');
+    $cacheDir      = __DIR__ . '/cache/';
+    $cacheFile     = $cacheDir . hash('sha256', $apiUrl . '_' . $userAgent) . '_v2.json';
+    $cacheLifetime = 300;   // 5 minutes fresh cache
+    $staleLifetime = 86400; // 24 hours fallback retention for network disruptions
 
     // Garbage Collection: Clean up expired cache files (5% probability to avoid performance issues)
     if (random_int(1, 20) === 1 && is_dir($cacheDir)) {
@@ -60,7 +150,7 @@ function fetchJsonFromUrl(string $apiUrl): ?array
             $now = time();
             $deleted = 0;
             foreach ($files as $file) {
-                if (is_file($file) && ($now - filemtime($file)) >= $cacheLifetime) {
+                if (is_file($file) && ($now - (filemtime($file) ?: 0)) >= $staleLifetime) {
                     @unlink($file);
                     if (++$deleted >= 50) {
                         break;
@@ -70,23 +160,65 @@ function fetchJsonFromUrl(string $apiUrl): ?array
         }
     }
 
-    if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < $cacheLifetime) {
-        $cached = json_decode(file_get_contents($cacheFile), true);
+    $staleCached = null;
+    if (file_exists($cacheFile)) {
+        $fileMtime = filemtime($cacheFile) ?: 0;
+        $fileAge   = time() - $fileMtime;
+        $cached    = json_decode((string) file_get_contents($cacheFile), true);
+
         if (json_last_error() === JSON_ERROR_NONE && isset($cached['headers'], $cached['body'])) {
-            return $cached;
+            if ($fileAge < $cacheLifetime) {
+                return $cached;
+            }
+            if ($fileAge < $staleLifetime) {
+                $staleCached = $cached;
+            }
         }
     }
 
     $proxyUrl     = defined('PROXY_URL') ? trim(PROXY_URL) : '';
     $acceptHeader = str_replace(["\r", "\n"], '', $_SERVER['HTTP_ACCEPT'] ?? 'application/json');
+    $clientIp     = getClientIp();
 
-    // If proxy is set, let proxy handle routing; otherwise prefer IPv6 first (critical for Iranian networks & bypassing Cloudflare/origin IPv4 bans),
-    // and fallback to IPv4 if IPv6 fails or is unavailable.
-    $ipResolveAttempts = ($proxyUrl !== '')
-        ? [CURL_IPRESOLVE_WHATEVER]
-        : [CURL_IPRESOLVE_V6, CURL_IPRESOLVE_V4];
+    $headersToSend = [
+        'Accept: ' . $acceptHeader,
+        'Accept-Charset: utf-8',
+        'User-Agent: ' . $userAgent,
+    ];
+    if ($clientIp !== '') {
+        $headersToSend[] = 'X-Forwarded-For: ' . $clientIp;
+        $headersToSend[] = 'X-Real-IP: ' . $clientIp;
+    }
 
-    foreach ($ipResolveAttempts as $ipResolve) {
+    // Build connection attempts:
+    // Attempt 1: Direct connection first (IPv4 prioritized to avoid 5-second IPv6 blackhole hanging in Iranian datacenters)
+    $attempts = [
+        [
+            'use_proxy'       => false,
+            'ip_resolve'      => CURL_IPRESOLVE_V4,
+            'connect_timeout' => 4,
+            'timeout'         => 7,
+        ]
+    ];
+
+    // Attempt 2: Proxy fallback if configured, otherwise IPv6 fallback if direct IPv4 fails
+    if ($proxyUrl !== '') {
+        $attempts[] = [
+            'use_proxy'       => true,
+            'ip_resolve'      => CURL_IPRESOLVE_WHATEVER,
+            'connect_timeout' => 5,
+            'timeout'         => 10,
+        ];
+    } else {
+        $attempts[] = [
+            'use_proxy'       => false,
+            'ip_resolve'      => CURL_IPRESOLVE_V6,
+            'connect_timeout' => 4,
+            'timeout'         => 7,
+        ];
+    }
+
+    foreach ($attempts as $attempt) {
         $ch = curl_init();
         if ($ch === false) {
             continue;
@@ -110,24 +242,19 @@ function fetchJsonFromUrl(string $apiUrl): ?array
 
         curl_setopt($ch, CURLOPT_URL, $apiUrl);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+        curl_setopt($ch, CURLOPT_TIMEOUT, $attempt['timeout']);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, $attempt['connect_timeout']);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
         curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-        curl_setopt($ch, CURLOPT_IPRESOLVE, $ipResolve);
+        curl_setopt($ch, CURLOPT_IPRESOLVE, $attempt['ip_resolve']);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headersToSend);
 
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Accept: ' . $acceptHeader,
-            'Accept-Charset: utf-8',
-            'User-Agent: ' . $userAgent,
-        ]);
-
-        if ($proxyUrl !== '') {
+        if ($attempt['use_proxy'] && $proxyUrl !== '') {
             curl_setopt($ch, CURLOPT_PROXY, $proxyUrl);
-            if (stripos($proxyUrl, 'socks5') === 0) {
+            if (stripos($proxyUrl, 'socks5h://') === 0 || stripos($proxyUrl, 'socks5://') === 0) {
                 curl_setopt($ch, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5_HOSTNAME);
-            } elseif (stripos($proxyUrl, 'http') === 0) {
+            } elseif (stripos($proxyUrl, 'http://') === 0 || stripos($proxyUrl, 'https://') === 0) {
                 curl_setopt($ch, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
             }
         }
@@ -147,7 +274,7 @@ function fetchJsonFromUrl(string $apiUrl): ?array
             }
 
             $data = json_decode($response, true);
-            if (json_last_error() === JSON_ERROR_NONE) {
+            if (json_last_error() === JSON_ERROR_NONE && is_array($data)) {
                 $result = [
                     'headers' => $responseHeaders,
                     'body'    => $data
@@ -162,6 +289,11 @@ function fetchJsonFromUrl(string $apiUrl): ?array
                 return $result;
             }
         }
+    }
+
+    // Both direct and proxy failed: fall back to stale cache if requested
+    if ($allowStaleOnFailure && $staleCached !== null) {
+        return $staleCached;
     }
 
     return null;
@@ -334,7 +466,8 @@ HTML;
  */
 function processSubscription(string $url, string $apiUrl): void
 {
-    $apiResult = fetchJsonFromUrl($apiUrl);
+    // Enable allowStaleOnFailure so temporary network hiccups or filtering spikes don't drop configs
+    $apiResult = fetchJsonFromUrl($apiUrl, true);
 
     if ($apiResult !== null && !empty($apiResult['body']['is_valid'])) {
         // Valid VPN client: send specific allowed headers from API
@@ -358,6 +491,20 @@ function processSubscription(string $url, string $apiUrl): void
         $configs = (string) ($apiResult['body']['configs'] ?? '');
         echo normalizeConfigs($configs);
         return;
+    }
+
+    // If API fetch completely failed and no cache was found:
+    if ($apiResult === null) {
+        $userAgent = (string) ($_SERVER['HTTP_USER_AGENT'] ?? '');
+        $accept    = (string) ($_SERVER['HTTP_ACCEPT'] ?? '');
+
+        if (!isWebBrowser($userAgent, $accept)) {
+            // Return 502 to VPN clients and API consumers so apps DO NOT delete existing configs
+            http_response_code(502);
+            header('Content-Type: text/plain; charset=UTF-8');
+            echo "Error 502: Upstream subscription service temporarily unavailable. Please try again shortly.";
+            return;
+        }
     }
 
     // Browser or unknown client: render HTML redirect page
