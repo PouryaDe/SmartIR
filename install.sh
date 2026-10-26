@@ -524,87 +524,219 @@ function delete_site() {
     print_msg "Site $DOMAIN deleted successfully."
 }
 
+# Downloads and extracts the latest SmartIR release from GitHub into a target directory.
+# Arguments:
+#   $1 - Target directory path
+# Returns:
+#   0 on success, 1 on failure
+function download_smartlink_source() {
+    local target_dir="$1"
+    print_msg "Downloading latest release from GitHub..."
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    if wget -q https://github.com/PouryaDe/SmartIR/archive/refs/heads/main.zip -O "$tmp_dir/smartir.zip"; then
+        unzip -q "$tmp_dir/smartir.zip" -d "$tmp_dir"
+        
+        # Clean dev, test, and dependency files
+        rm -rf "$tmp_dir/SmartIR-main/tests" \
+               "$tmp_dir/SmartIR-main/phpunit.xml" \
+               "$tmp_dir/SmartIR-main/.phpunit.cache" \
+               "$tmp_dir/SmartIR-main/.vscode" \
+               "$tmp_dir/SmartIR-main/.git" \
+               "$tmp_dir/SmartIR-main/.gitignore" \
+               "$tmp_dir/SmartIR-main/composer.json" \
+               "$tmp_dir/SmartIR-main/composer.lock"
+
+        mkdir -p "$target_dir"
+        cp -r "$tmp_dir/SmartIR-main/." "$target_dir/"
+        rm -rf "$tmp_dir"
+        return 0
+    else
+        rm -rf "$tmp_dir"
+        print_err "Failed to download update from GitHub."
+        return 1
+    fi
+}
+
+# Updates files for a single SmartLink domain from a prepared source directory.
+# Preserves existing cache and config.php settings.
+# Arguments:
+#   $1 - Domain name
+#   $2 - Source directory containing unpacked release
+# Returns:
+#   0 on success, 1 on failure
+function perform_site_update() {
+    local domain="$1"
+    local source_dir="$2"
+
+    validate_domain "$domain" || return 1
+    local doc_root
+    doc_root=$(get_doc_root "$domain")
+
+    if [ -z "$doc_root" ] || [ ! -d "$doc_root" ] || [ ! -d "$source_dir" ]; then
+        return 1
+    fi
+
+    local current_proxy
+    current_proxy=$(get_site_proxy "$domain")
+    local current_api
+    current_api=$(get_site_api "$domain")
+
+    if [ -z "$current_api" ] || [ "$current_api" == "API_DOMAIN_PLACEHOLDER" ]; then
+        current_api="example.com"
+    fi
+
+    local current_debug="false"
+    if [ -f "$doc_root/config.php" ]; then
+        if grep -iqE "define\(['\"]APP_DEBUG['\"],\s*true\)" "$doc_root/config.php" 2>/dev/null; then
+            current_debug="true"
+        fi
+    fi
+
+    # Backup existing cache if present
+    local tmp_cache
+    tmp_cache=$(mktemp -d)
+    if [ -d "$doc_root/cache" ]; then
+        cp -r "$doc_root/cache/." "$tmp_cache/" 2>/dev/null || true
+    fi
+
+    # Replace site files with fresh source code safely
+    find "$doc_root" -mindepth 1 -delete 2>/dev/null || rm -rf "${doc_root:?}"/*
+    cp -r "$source_dir/." "$doc_root/"
+
+    # Restore cache
+    mkdir -p "$doc_root/cache"
+    if [ "$(ls -A "$tmp_cache" 2>/dev/null)" ]; then
+        cp -r "$tmp_cache/." "$doc_root/cache/" 2>/dev/null || true
+    fi
+    rm -rf "$tmp_cache"
+
+    # Restore config.php
+    cat > "$doc_root/config.php" <<EOF
+<?php
+define('API_DOMAIN', '$current_api');
+define('APP_DEBUG', $current_debug);
+define('PROXY_URL', '$current_proxy');
+EOF
+
+    chmod -R 755 "$doc_root" 2>/dev/null || true
+    chmod -R 777 "$doc_root/cache" 2>/dev/null || true
+    chown -R www-data:www-data "$doc_root" 2>/dev/null || true
+    return 0
+}
+
+# Interactive menu to update a single SmartLink domain, or route to bulk update.
 function update_site() {
-    print_msg "Currently installed SmartLink sites:"
+    print_info "Update SmartLink Source Code"
     mapfile -t domains < <(get_smartlink_domains)
-    
+
     if [ ${#domains[@]} -eq 0 ]; then
         print_err "No SmartLink sites found."
         return
     fi
 
-    echo "Select a Domain to update:"
-    select DOMAIN in "${domains[@]}" "Cancel"; do
-        if [ "$DOMAIN" == "Cancel" ]; then
-            print_msg "Aborted."
-            return
-        elif [ -n "$DOMAIN" ]; then
-            break
+    echo ""
+    echo -e "  ${CYAN}Select a domain to update:${NC}"
+    for i in "${!domains[@]}"; do
+        local d="${domains[$i]}"
+        local api
+        api=$(get_site_api "$d")
+        echo -e "  ${WHITE}$((i+1)))${NC} $d ${DIM}(API: $api)${NC}"
+    done
+    local all_opt=$(( ${#domains[@]} + 1 ))
+    local cancel_opt=$(( ${#domains[@]} + 2 ))
+    echo -e "  ${WHITE}$all_opt)${NC} ${CYAN}[Update ALL sites]${NC}"
+    echo -e "  ${WHITE}$cancel_opt)${NC} ${RED}Cancel${NC}"
+    echo ""
+
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-$cancel_opt]: " CHOICE
+
+    if [ "$CHOICE" == "$cancel_opt" ] || [ "$CHOICE" == "c" ] || [ "$CHOICE" == "C" ]; then
+        print_msg "Aborted."
+        return
+    fi
+
+    if [ "$CHOICE" == "$all_opt" ] || [ "$CHOICE" == "a" ] || [ "$CHOICE" == "A" ]; then
+        update_all_sites
+        return
+    fi
+
+    if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "${#domains[@]}" ]; then
+        print_err "Invalid selection. Please try again."
+        return
+    fi
+
+    local DOMAIN="${domains[$((CHOICE - 1))]}"
+    local prep_dir
+    prep_dir=$(mktemp -d)
+    if ! download_smartlink_source "$prep_dir"; then
+        rm -rf "$prep_dir"
+        return 1
+    fi
+
+    print_info "Updating $DOMAIN..."
+    if perform_site_update "$DOMAIN" "$prep_dir"; then
+        print_msg "Clearing PHP OPcache..."
+        systemctl reload php8.1-fpm 2>/dev/null || true
+        print_msg "Site $DOMAIN updated successfully!"
+    else
+        print_err "Failed to update $DOMAIN."
+    fi
+
+    rm -rf "$prep_dir"
+}
+
+# Updates all configured SmartLink sites to the latest version in a single operation.
+function update_all_sites() {
+    print_info "Update Source Code for ALL SmartLink Sites"
+    mapfile -t domains < <(get_smartlink_domains)
+
+    if [ ${#domains[@]} -eq 0 ]; then
+        print_err "No SmartLink sites found."
+        return
+    fi
+
+    echo ""
+    echo -e "  ${CYAN}The following ${#domains[@]} SmartLink site(s) will be updated:${NC}"
+    for i in "${!domains[@]}"; do
+        local d="${domains[$i]}"
+        local api
+        api=$(get_site_api "$d")
+        echo -e "  ${WHITE}[$((i+1))]${NC} $d ${DIM}(API: $api)${NC}"
+    done
+
+    echo ""
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Update all ${#domains[@]} site(s) to latest release? [y/N]: " CONFIRM
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+        print_msg "Aborted."
+        return
+    fi
+
+    local prep_dir
+    prep_dir=$(mktemp -d)
+    if ! download_smartlink_source "$prep_dir"; then
+        rm -rf "$prep_dir"
+        return 1
+    fi
+
+    local updated_count=0
+    for d in "${domains[@]}"; do
+        print_info "Updating $d..."
+        if perform_site_update "$d" "$prep_dir"; then
+            print_msg "$d updated successfully."
+            updated_count=$((updated_count + 1))
         else
-            print_err "Invalid selection. Please try again."
+            print_err "Failed to update $d."
         fi
     done
 
-    local DOC_ROOT
-    DOC_ROOT=$(get_doc_root "$DOMAIN")
-
-    if [ ! -d "$DOC_ROOT" ]; then
-        print_err "Directory $DOC_ROOT does not exist. Are you sure the site is installed?"
-        return
-    fi
-
-    print_msg "Extracting current configuration..."
-    local CURRENT_PROXY
-    CURRENT_PROXY=$(get_site_proxy "$DOMAIN")
-    local CURRENT_API
-    CURRENT_API=$(get_site_api "$DOMAIN")
-
-    if [ -z "$CURRENT_API" ] || [ "$CURRENT_API" == "API_DOMAIN_PLACEHOLDER" ]; then
-        read -p "Could not detect API Domain. Please enter API Domain Name manually: " CURRENT_API
-        CURRENT_API=$(echo "$CURRENT_API" | tr '[:upper:]' '[:lower:]' | xargs)
-        if ! validate_domain "$CURRENT_API"; then
-            print_err "Invalid API domain format. Update aborted."
-            return
-        fi
-    fi
-
-    print_msg "Updating source code from GitHub (via ZIP)..."
-    TMP_DIR=$(mktemp -d)
-    if wget -q https://github.com/PouryaDe/SmartIR/archive/refs/heads/main.zip -O "$TMP_DIR/smartir.zip"; then
-        unzip -q "$TMP_DIR/smartir.zip" -d "$TMP_DIR"
-        cd /var/www || return
-        rm -rf "$DOC_ROOT"
-        mv "$TMP_DIR/SmartIR-main" "$DOC_ROOT"
-        rm -rf "$TMP_DIR"
-    else
-        print_err "Failed to download update from GitHub. Update aborted."
-        rm -rf "$TMP_DIR"
-        return
-    fi
-
-    # Remove dev, test, and dependency files from public docroot
-    rm -rf "$DOC_ROOT/tests" "$DOC_ROOT/phpunit.xml" "$DOC_ROOT/.phpunit.cache" \
-           "$DOC_ROOT/.vscode" "$DOC_ROOT/.git" "$DOC_ROOT/.gitignore" \
-           "$DOC_ROOT/composer.json" "$DOC_ROOT/composer.lock"
-
-    chown -R www-data:www-data "$DOC_ROOT"
-
-    print_msg "Restoring configuration..."
-    cat > "$DOC_ROOT/config.php" <<EOF
-<?php
-define('API_DOMAIN', '$CURRENT_API');
-define('APP_DEBUG', false);
-define('PROXY_URL', '$CURRENT_PROXY');
-EOF
-    chown www-data:www-data "$DOC_ROOT/config.php"
-
-    mkdir -p "$DOC_ROOT/cache"
-    chown www-data:www-data "$DOC_ROOT/cache"
+    rm -rf "$prep_dir"
 
     print_msg "Clearing PHP OPcache..."
-    systemctl reload php8.1-fpm
+    systemctl reload php8.1-fpm 2>/dev/null || true
 
-    print_msg "Site $DOMAIN updated successfully!"
+    echo ""
+    print_msg "Update complete: $updated_count of ${#domains[@]} site(s) updated successfully!"
 }
 
 function clear_cache() {
@@ -890,15 +1022,16 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo -e "  ${WHITE}2)${NC}  ${CYAN}Add a New Site${NC}"
         echo -e "  ${WHITE}3)${NC}  ${CYAN}List Sites & Proxies${NC}"
         echo -e "  ${WHITE}4)${NC}  ${CYAN}Delete a Site${NC}"
-        echo -e "  ${WHITE}5)${NC}  ${CYAN}Update Source Code${NC}"
-        echo -e "  ${WHITE}6)${NC}  ${YELLOW}Clear Cache${NC}"
-        echo -e "  ${WHITE}7)${NC}  ${YELLOW}Configure Proxy (Single Domain)${NC}"
-        echo -e "  ${WHITE}8)${NC}  ${YELLOW}Configure Proxy (All Domains)${NC}"
-        echo -e "  ${WHITE}9)${NC}  ${YELLOW}Remove Proxy from ALL Domains${NC}"
-        echo -e "  ${WHITE}10)${NC} ${RED}Exit${NC}"
+        echo -e "  ${WHITE}5)${NC}  ${CYAN}Update Source Code (Single Site)${NC}"
+        echo -e "  ${WHITE}6)${NC}  ${CYAN}Update Source Code (All Sites)${NC}"
+        echo -e "  ${WHITE}7)${NC}  ${YELLOW}Clear Cache${NC}"
+        echo -e "  ${WHITE}8)${NC}  ${YELLOW}Configure Proxy (Single Domain)${NC}"
+        echo -e "  ${WHITE}9)${NC}  ${YELLOW}Configure Proxy (All Domains)${NC}"
+        echo -e "  ${WHITE}10)${NC} ${YELLOW}Remove Proxy from ALL Domains${NC}"
+        echo -e "  ${WHITE}11)${NC} ${RED}Exit${NC}"
         echo ""
         draw_line
-        read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-10]: " OPTION
+        read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-11]: " OPTION
         draw_line
         echo ""
 
@@ -908,11 +1041,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             3) list_sites ;;
             4) delete_site ;;
             5) update_site ;;
-            6) clear_cache ;;
-            7) configure_proxy ;;
-            8) configure_proxy_all ;;
-            9) remove_proxy_all ;;
-            10) echo -e "  ${DIM}Goodbye!${NC}\n"; exit 0 ;;
+            6) update_all_sites ;;
+            7) clear_cache ;;
+            8) configure_proxy ;;
+            9) configure_proxy_all ;;
+            10) remove_proxy_all ;;
+            11) echo -e "  ${DIM}Goodbye!${NC}\n"; exit 0 ;;
             *) print_err "Invalid option. Please try again." ;;
         esac
 
