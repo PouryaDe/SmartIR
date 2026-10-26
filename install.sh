@@ -10,7 +10,7 @@ WHITE='\033[1;37m'
 DIM='\033[2m'
 NC='\033[0m'
 
-VERSION="2.9"
+VERSION="3.0"
 
 function print_msg()  { echo -e "${GREEN}  ✔  $1${NC}"; }
 function print_err()  { echo -e "${RED}  ✘  $1${NC}"; }
@@ -260,17 +260,224 @@ EOF
     fi
 }
 
+# ------------------------------------------------------------------------------
+# SmartLink Helper Functions & Domain Discovery
+# ------------------------------------------------------------------------------
+
+# Resolves the document root path for a given domain.
+# First checks standard /var/www/<domain>. If absent, parses Nginx vhost config.
+# Arguments:
+#   $1 - Domain name
+# Outputs:
+#   Path to document root directory
+function get_doc_root() {
+    local domain="$1"
+    local base_www="${SMARTLINK_VAR_WWW:-/var/www}"
+    local doc_root="$base_www/$domain"
+    if [ -d "$doc_root" ]; then
+        echo "$doc_root"
+        return 0
+    fi
+
+    local base_nginx="${SMARTLINK_NGINX_CONF_DIR:-/etc/nginx/sites-enabled}"
+    local nginx_conf="$base_nginx/$domain"
+    [ -f "$nginx_conf" ] || nginx_conf="${SMARTLINK_NGINX_AVAIL_DIR:-/etc/nginx/sites-available}/$domain"
+    if [ -f "$nginx_conf" ]; then
+        local detected_root
+        detected_root=$(grep -E '^\s*root\s+' "$nginx_conf" 2>/dev/null | head -n 1 | awk '{print $2}' | tr -d ';')
+        if [ -n "$detected_root" ] && [ -d "$detected_root" ]; then
+            echo "$detected_root"
+            return 0
+        fi
+    fi
+    echo "$doc_root"
+    return 1
+}
+
+# Verifies whether a given domain belongs to an IR SmartLink installation.
+# Protects non-SmartLink vhosts (WordPress, panels, static sites) from being touched.
+# Arguments:
+#   $1 - Domain name
+# Returns:
+#   0 if domain is a valid SmartLink site, 1 otherwise.
+function is_smartlink_site() {
+    local domain="$1"
+    [ -n "$domain" ] || return 1
+    [ "$domain" == "default" ] && return 1
+
+    # Disallow backup configs (.bak, .old, .disabled, etc.), swap files (.swp), or hidden files
+    if [[ "$domain" =~ \.(bak|save|old|disabled|conf|orig|swp)$ ]] || [[ "$domain" =~ ^\. ]]; then
+        return 1
+    fi
+
+    # Disallow malformed domain or IP names
+    validate_domain "$domain" || return 1
+
+    local doc_root
+    doc_root=$(get_doc_root "$domain")
+
+    [ -d "$doc_root" ] || return 1
+    [ -f "$doc_root/index.php" ] || return 1
+
+    # Must contain API_DOMAIN in config.php (current) or index.php (legacy)
+    if [ -f "$doc_root/config.php" ] && grep -q "API_DOMAIN" "$doc_root/config.php" 2>/dev/null; then
+        return 0
+    elif grep -q "API_DOMAIN" "$doc_root/index.php" 2>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Discovers and outputs all active IR SmartLink domains configured in Nginx.
+# Filters out disabled sites, the default Nginx page, and non-SmartLink hosts.
+# Outputs:
+#   Newline-separated list of validated SmartLink domain names
+function get_smartlink_domains() {
+    local base_nginx="${SMARTLINK_NGINX_CONF_DIR:-/etc/nginx/sites-enabled}"
+    local domains=()
+    if [ -d "$base_nginx" ]; then
+        for conf in "$base_nginx"/*; do
+            [ -e "$conf" ] || continue
+            local domain
+            domain=$(basename "$conf")
+            if is_smartlink_site "$domain"; then
+                domains+=("$domain")
+            fi
+        done
+    fi
+    for d in "${domains[@]}"; do
+        [ -n "$d" ] && echo "$d"
+    done
+}
+
+# Extracts the current PROXY_URL configured for a site.
+# Arguments:
+#   $1 - Domain name
+# Outputs:
+#   Proxy URL string or empty if direct connection
+function get_site_proxy() {
+    local domain="$1"
+    local doc_root
+    doc_root=$(get_doc_root "$domain")
+    local config_file="$doc_root/config.php"
+
+    if [ -f "$config_file" ]; then
+        local p
+        p=$(grep "PROXY_URL" "$config_file" 2>/dev/null | sed -n "s/.*PROXY_URL['\"]\s*,\s*['\"]\([^'\"]*\)['\"].*/\1/p" | head -n 1)
+        if [ -z "$p" ]; then
+            p=$(grep "define('PROXY_URL'" "$config_file" 2>/dev/null | awk -F"'" '{print $4}' | head -n 1)
+        fi
+        echo "$p"
+    fi
+}
+
+# Extracts the current API_DOMAIN configured for a site.
+# Arguments:
+#   $1 - Domain name
+# Outputs:
+#   Upstream API domain string
+function get_site_api() {
+    local domain="$1"
+    local doc_root
+    doc_root=$(get_doc_root "$domain")
+    local config_file="$doc_root/config.php"
+
+    if [ -f "$config_file" ]; then
+        local a
+        a=$(grep "API_DOMAIN" "$config_file" 2>/dev/null | sed -n "s/.*API_DOMAIN['\"]\s*,\s*['\"]\([^'\"]*\)['\"].*/\1/p" | head -n 1)
+        if [ -z "$a" ]; then
+            a=$(grep "define('API_DOMAIN'" "$config_file" 2>/dev/null | awk -F"'" '{print $4}' | head -n 1)
+        fi
+        echo "$a"
+    elif [ -f "$doc_root/index.php" ]; then
+        grep "define('API_DOMAIN'" "$doc_root/index.php" 2>/dev/null | awk -F"'" '{print $4}' | head -n 1
+    fi
+}
+
+# Updates the proxy configuration for a specific SmartLink domain.
+# Preserves existing API_DOMAIN and APP_DEBUG settings.
+# Arguments:
+#   $1 - Domain name
+#   $2 - New proxy URL (empty string clears proxy)
+# Returns:
+#   0 on success, 1 on failure
+function set_site_proxy() {
+    local domain="$1"
+    local new_proxy="$2"
+
+    # Defense-in-depth validation to prevent code injection into config.php
+    validate_domain "$domain" || return 1
+    validate_proxy "$new_proxy" || return 1
+
+    local doc_root
+    doc_root=$(get_doc_root "$domain")
+    local config_file="$doc_root/config.php"
+
+    if [ ! -d "$doc_root" ]; then
+        return 1
+    fi
+
+    local current_api
+    current_api=$(get_site_api "$domain")
+    if [ -z "$current_api" ] || [ "$current_api" == "API_DOMAIN_PLACEHOLDER" ] || ! validate_domain "$current_api"; then
+        current_api="example.com"
+    fi
+
+    local current_debug="false"
+    if [ -f "$config_file" ]; then
+        if grep -iqE "define\(['\"]APP_DEBUG['\"],\s*true\)" "$config_file" 2>/dev/null; then
+            current_debug="true"
+        fi
+    fi
+
+    cat > "$config_file" <<EOF
+<?php
+define('API_DOMAIN', '$current_api');
+define('APP_DEBUG', $current_debug);
+define('PROXY_URL', '$new_proxy');
+EOF
+    chown www-data:www-data "$config_file" 2>/dev/null || true
+    return 0
+}
+
 function list_sites() {
-    print_msg "Currently enabled sites:"
-    ls -1 /etc/nginx/sites-enabled/ | grep -v "default" || echo "No sites found."
+    print_info "Currently installed SmartLink sites:"
+    mapfile -t domains < <(get_smartlink_domains)
+
+    if [ ${#domains[@]} -eq 0 ]; then
+        print_err "No SmartLink sites found."
+        return
+    fi
+
+    echo ""
+    draw_line
+    for i in "${!domains[@]}"; do
+        local d="${domains[$i]}"
+        local p
+        p=$(get_site_proxy "$d")
+        local api
+        api=$(get_site_api "$d")
+        local num=$((i + 1))
+
+        if [ -n "$p" ]; then
+            echo -e "  ${WHITE}[$num]${NC} ${CYAN}$d${NC} ${DIM}➜${NC} Proxy: ${GREEN}$p${NC}"
+        else
+            echo -e "  ${WHITE}[$num]${NC} ${CYAN}$d${NC} ${DIM}➜${NC} Proxy: ${YELLOW}None (Direct)${NC}"
+        fi
+        if [ -n "$api" ]; then
+            echo -e "      ${DIM}↳ API Domain: $api${NC}"
+        fi
+    done
+    draw_line
 }
 
 function delete_site() {
-    print_msg "Currently installed sites:"
-    mapfile -t domains < <(ls -1 /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "default")
+    print_msg "Currently installed SmartLink sites:"
+    mapfile -t domains < <(get_smartlink_domains)
     
     if [ ${#domains[@]} -eq 0 ]; then
-        print_err "No sites found."
+        print_err "No SmartLink sites found."
         return
     fi
 
@@ -302,10 +509,14 @@ function delete_site() {
     rm -f "/etc/nginx/sites-available/$DOMAIN"
 
     print_msg "Removing web directory..."
-    rm -rf "/var/www/$DOMAIN"
+    local doc_root
+    doc_root=$(get_doc_root "$DOMAIN")
+    if [ -n "$doc_root" ] && [ "$doc_root" != "/" ] && [ "$doc_root" != "/var/www" ]; then
+        rm -rf "$doc_root"
+    fi
 
     print_msg "Revoking SSL certificate..."
-    certbot delete --cert-name "$DOMAIN" --non-interactive
+    certbot delete --cert-name "$DOMAIN" --non-interactive 2>/dev/null
 
     print_msg "Reloading Nginx..."
     systemctl reload nginx
@@ -314,11 +525,11 @@ function delete_site() {
 }
 
 function update_site() {
-    print_msg "Currently installed sites:"
-    mapfile -t domains < <(ls -1 /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "default")
+    print_msg "Currently installed SmartLink sites:"
+    mapfile -t domains < <(get_smartlink_domains)
     
     if [ ${#domains[@]} -eq 0 ]; then
-        print_err "No sites found."
+        print_err "No SmartLink sites found."
         return
     fi
 
@@ -334,7 +545,8 @@ function update_site() {
         fi
     done
 
-    DOC_ROOT="/var/www/$DOMAIN"
+    local DOC_ROOT
+    DOC_ROOT=$(get_doc_root "$DOMAIN")
 
     if [ ! -d "$DOC_ROOT" ]; then
         print_err "Directory $DOC_ROOT does not exist. Are you sure the site is installed?"
@@ -342,13 +554,10 @@ function update_site() {
     fi
 
     print_msg "Extracting current configuration..."
-    CURRENT_PROXY=""
-    if [ -f "$DOC_ROOT/config.php" ]; then
-        CURRENT_API=$(grep "define('API_DOMAIN'" "$DOC_ROOT/config.php" | awk -F"'" '{print $4}')
-        CURRENT_PROXY=$(grep "define('PROXY_URL'" "$DOC_ROOT/config.php" 2>/dev/null | awk -F"'" '{print $4}')
-    else
-        CURRENT_API=$(grep "define('API_DOMAIN'" "$DOC_ROOT/index.php" | awk -F"'" '{print $4}' 2>/dev/null)
-    fi
+    local CURRENT_PROXY
+    CURRENT_PROXY=$(get_site_proxy "$DOMAIN")
+    local CURRENT_API
+    CURRENT_API=$(get_site_api "$DOMAIN")
 
     if [ -z "$CURRENT_API" ] || [ "$CURRENT_API" == "API_DOMAIN_PLACEHOLDER" ]; then
         read -p "Could not detect API Domain. Please enter API Domain Name manually: " CURRENT_API
@@ -399,11 +608,11 @@ EOF
 }
 
 function clear_cache() {
-    print_info "Currently installed sites:"
-    mapfile -t domains < <(ls -1 /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "default")
+    print_info "Currently installed SmartLink sites:"
+    mapfile -t domains < <(get_smartlink_domains)
 
     if [ ${#domains[@]} -eq 0 ]; then
-        print_err "No sites found."
+        print_err "No SmartLink sites found."
         return
     fi
 
@@ -420,14 +629,16 @@ function clear_cache() {
         fi
     done
 
-    CACHE_DIR="/var/www/$DOMAIN/cache"
+    local doc_root
+    doc_root=$(get_doc_root "$DOMAIN")
+    local CACHE_DIR="$doc_root/cache"
 
     if [ ! -d "$CACHE_DIR" ]; then
         print_err "Cache directory not found: $CACHE_DIR"
         return
     fi
 
-    FILE_COUNT=$(find "$CACHE_DIR" -name '*.json' | wc -l)
+    FILE_COUNT=$(find "$CACHE_DIR" -name '*.json' 2>/dev/null | wc -l)
 
     if [ "$FILE_COUNT" -eq 0 ]; then
         print_info "Cache is already empty for $DOMAIN."
@@ -438,40 +649,26 @@ function clear_cache() {
     print_msg "Cleared $FILE_COUNT cached file(s) for $DOMAIN."
 }
 
-function configure_proxy() {
-    print_info "Currently installed sites:"
-    mapfile -t domains < <(ls -1 /etc/nginx/sites-enabled/ 2>/dev/null | grep -v "default")
-
-    if [ ${#domains[@]} -eq 0 ]; then
-        print_err "No sites found."
-        return
-    fi
-
-    echo ""
-    echo -e "  ${CYAN}Select a domain to configure its proxy:${NC}"
-    select DOMAIN in "${domains[@]}" "Cancel"; do
-        if [ "$DOMAIN" == "Cancel" ]; then
-            print_msg "Aborted."
-            return
-        elif [ -n "$DOMAIN" ]; then
-            break
-        else
-            print_err "Invalid selection. Please try again."
-        fi
-    done
-
-    CONFIG_FILE="/var/www/$DOMAIN/config.php"
+# Configures proxy for a single selected SmartLink domain.
+# Arguments:
+#   $1 - Domain name
+function configure_single_domain_proxy() {
+    local DOMAIN="$1"
+    local doc_root
+    doc_root=$(get_doc_root "$DOMAIN")
+    local CONFIG_FILE="$doc_root/config.php"
 
     if [ ! -f "$CONFIG_FILE" ]; then
         print_err "config.php not found for $DOMAIN."
         return
     fi
 
-    CURRENT_PROXY=$(grep "define('PROXY_URL'" "$CONFIG_FILE" | awk -F"'" '{print $4}')
+    local CURRENT_PROXY
+    CURRENT_PROXY=$(get_site_proxy "$DOMAIN")
     if [ -n "$CURRENT_PROXY" ]; then
-        print_info "Current proxy: $CURRENT_PROXY"
+        print_info "Current proxy for $DOMAIN: $CURRENT_PROXY"
     else
-        print_info "No proxy currently configured."
+        print_info "No proxy currently configured for $DOMAIN."
     fi
 
     echo ""
@@ -485,21 +682,197 @@ function configure_proxy() {
         return
     fi
 
-    CURRENT_API=$(grep "define('API_DOMAIN'" "$CONFIG_FILE" | awk -F"'" '{print $4}')
-
-    cat > "$CONFIG_FILE" <<EOF
-<?php
-define('API_DOMAIN', '$CURRENT_API');
-define('APP_DEBUG', false);
-define('PROXY_URL', '$NEW_PROXY');
-EOF
-    chown www-data:www-data "$CONFIG_FILE"
-
-    if [ -z "$NEW_PROXY" ]; then
-        print_msg "Proxy removed for $DOMAIN."
+    if set_site_proxy "$DOMAIN" "$NEW_PROXY"; then
+        systemctl reload php8.1-fpm 2>/dev/null || true
+        if [ -z "$NEW_PROXY" ]; then
+            print_msg "Proxy removed for $DOMAIN."
+        else
+            print_msg "Proxy configured for $DOMAIN: $NEW_PROXY"
+        fi
     else
-        print_msg "Proxy configured for $DOMAIN: $NEW_PROXY"
+        print_err "Failed to update configuration for $DOMAIN."
     fi
+}
+
+# Interactive menu to select a single SmartLink domain, or route to bulk operations.
+function configure_proxy() {
+    print_info "Currently installed SmartLink sites:"
+    mapfile -t domains < <(get_smartlink_domains)
+
+    if [ ${#domains[@]} -eq 0 ]; then
+        print_err "No SmartLink sites found."
+        return
+    fi
+
+    echo ""
+    echo -e "  ${CYAN}Select a domain to configure its proxy:${NC}"
+    for i in "${!domains[@]}"; do
+        local d="${domains[$i]}"
+        local p
+        p=$(get_site_proxy "$d")
+        local num=$((i + 1))
+        if [ -n "$p" ]; then
+            echo -e "  ${WHITE}$num)${NC} $d ${DIM}➜${NC} Proxy: ${GREEN}$p${NC}"
+        else
+            echo -e "  ${WHITE}$num)${NC} $d ${DIM}➜${NC} Proxy: ${YELLOW}None (Direct)${NC}"
+        fi
+    done
+    local all_opt=$(( ${#domains[@]} + 1 ))
+    local rem_opt=$(( ${#domains[@]} + 2 ))
+    local cancel_opt=$(( ${#domains[@]} + 3 ))
+    echo -e "  ${WHITE}$all_opt)${NC} ${CYAN}[Apply proxy to ALL domains]${NC}"
+    echo -e "  ${WHITE}$rem_opt)${NC} ${YELLOW}[Remove proxy from ALL domains]${NC}"
+    echo -e "  ${WHITE}$cancel_opt)${NC} ${RED}Cancel${NC}"
+    echo ""
+
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-$cancel_opt]: " CHOICE
+
+    if [ "$CHOICE" == "$cancel_opt" ] || [ "$CHOICE" == "c" ] || [ "$CHOICE" == "C" ]; then
+        print_msg "Aborted."
+        return
+    fi
+
+    if [ "$CHOICE" == "$all_opt" ] || [ "$CHOICE" == "a" ] || [ "$CHOICE" == "A" ]; then
+        configure_proxy_all
+        return
+    fi
+
+    if [ "$CHOICE" == "$rem_opt" ] || [ "$CHOICE" == "r" ] || [ "$CHOICE" == "R" ]; then
+        remove_proxy_all
+        return
+    fi
+
+    if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "${#domains[@]}" ]; then
+        print_err "Invalid selection. Please try again."
+        return
+    fi
+
+    local SELECTED_DOMAIN="${domains[$((CHOICE - 1))]}"
+    configure_single_domain_proxy "$SELECTED_DOMAIN"
+}
+
+# Configures the same proxy URL for all SmartLink sites at once.
+function configure_proxy_all() {
+    print_info "Configure Proxy for ALL SmartLink Sites"
+    mapfile -t domains < <(get_smartlink_domains)
+
+    if [ ${#domains[@]} -eq 0 ]; then
+        print_err "No SmartLink sites found."
+        return
+    fi
+
+    echo ""
+    echo -e "  ${CYAN}The following ${#domains[@]} SmartLink site(s) will be affected:${NC}"
+    for i in "${!domains[@]}"; do
+        local d="${domains[$i]}"
+        local p
+        p=$(get_site_proxy "$d")
+        local num=$((i + 1))
+        if [ -n "$p" ]; then
+            echo -e "  ${WHITE}[$num]${NC} $d ${DIM}➜${NC} Proxy: ${GREEN}$p${NC}"
+        else
+            echo -e "  ${WHITE}[$num]${NC} $d ${DIM}➜${NC} Proxy: ${YELLOW}None (Direct)${NC}"
+        fi
+    done
+
+    echo ""
+    echo -e "  ${DIM}Format: socks5://USERNAME:PASSWORD@PROXY_IP:PORT${NC}"
+    echo -e "  ${DIM}Leave empty to remove proxy from ALL domains.${NC}"
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Enter proxy URL for ALL domains: " NEW_PROXY
+    NEW_PROXY=$(echo "$NEW_PROXY" | xargs)
+
+    if ! validate_proxy "$NEW_PROXY"; then
+        print_err "Invalid proxy URL format. Example: socks5://user:pass@1.2.3.4:1080"
+        return
+    fi
+
+    echo ""
+    if [ -z "$NEW_PROXY" ]; then
+        read -rp "  $(echo -e "${YELLOW}›${NC}") Are you sure you want to REMOVE proxy from ALL ${#domains[@]} site(s)? [y/N]: " CONFIRM
+    else
+        read -rp "  $(echo -e "${YELLOW}›${NC}") Apply proxy to ALL ${#domains[@]} site(s)? [y/N]: " CONFIRM
+    fi
+
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+        print_msg "Aborted."
+        return
+    fi
+
+    local updated_count=0
+    for d in "${domains[@]}"; do
+        if set_site_proxy "$d" "$NEW_PROXY"; then
+            updated_count=$((updated_count + 1))
+        else
+            print_err "Failed to update proxy for $d"
+        fi
+    done
+
+    if [ "$updated_count" -gt 0 ]; then
+        systemctl reload php8.1-fpm 2>/dev/null || true
+    fi
+
+    echo ""
+    if [ -z "$NEW_PROXY" ]; then
+        print_msg "Proxy removed successfully from $updated_count site(s)."
+    else
+        print_msg "Proxy successfully applied to $updated_count site(s): $NEW_PROXY"
+    fi
+}
+
+# Removes proxy configuration from all SmartLink sites, restoring direct routing.
+function remove_proxy_all() {
+    print_info "Remove Proxy from ALL SmartLink Sites"
+    mapfile -t domains < <(get_smartlink_domains)
+
+    if [ ${#domains[@]} -eq 0 ]; then
+        print_err "No SmartLink sites found."
+        return
+    fi
+
+    echo ""
+    echo -e "  ${CYAN}The following ${#domains[@]} SmartLink site(s) will have their proxy removed:${NC}"
+    local active_proxies=0
+    for i in "${!domains[@]}"; do
+        local d="${domains[$i]}"
+        local p
+        p=$(get_site_proxy "$d")
+        local num=$((i + 1))
+        if [ -n "$p" ]; then
+            echo -e "  ${WHITE}[$num]${NC} $d ${DIM}➜${NC} Proxy: ${GREEN}$p${NC}"
+            active_proxies=$((active_proxies + 1))
+        else
+            echo -e "  ${WHITE}[$num]${NC} $d ${DIM}➜${NC} Proxy: ${YELLOW}None (Direct)${NC}"
+        fi
+    done
+
+    if [ "$active_proxies" -eq 0 ]; then
+        echo ""
+        print_info "All sites are already using direct connections (no active proxies)."
+        return
+    fi
+
+    echo ""
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Are you sure you want to REMOVE proxy from ALL ${#domains[@]} site(s)? [y/N]: " CONFIRM
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+        print_msg "Aborted."
+        return
+    fi
+
+    local removed_count=0
+    for d in "${domains[@]}"; do
+        if set_site_proxy "$d" ""; then
+            removed_count=$((removed_count + 1))
+        else
+            print_err "Failed to remove proxy for $d"
+        fi
+    done
+
+    if [ "$removed_count" -gt 0 ]; then
+        systemctl reload php8.1-fpm 2>/dev/null || true
+    fi
+
+    echo ""
+    print_msg "Proxy removed successfully from all $removed_count site(s). All sites now connect directly."
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -515,15 +888,17 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo ""
         echo -e "  ${WHITE}1)${NC}  ${CYAN}Install Prerequisites${NC}"
         echo -e "  ${WHITE}2)${NC}  ${CYAN}Add a New Site${NC}"
-        echo -e "  ${WHITE}3)${NC}  ${CYAN}List Sites${NC}"
+        echo -e "  ${WHITE}3)${NC}  ${CYAN}List Sites & Proxies${NC}"
         echo -e "  ${WHITE}4)${NC}  ${CYAN}Delete a Site${NC}"
         echo -e "  ${WHITE}5)${NC}  ${CYAN}Update Source Code${NC}"
         echo -e "  ${WHITE}6)${NC}  ${YELLOW}Clear Cache${NC}"
-        echo -e "  ${WHITE}7)${NC}  ${YELLOW}Configure Proxy${NC}"
-        echo -e "  ${WHITE}8)${NC}  ${RED}Exit${NC}"
+        echo -e "  ${WHITE}7)${NC}  ${YELLOW}Configure Proxy (Single Domain)${NC}"
+        echo -e "  ${WHITE}8)${NC}  ${YELLOW}Configure Proxy (All Domains)${NC}"
+        echo -e "  ${WHITE}9)${NC}  ${YELLOW}Remove Proxy from ALL Domains${NC}"
+        echo -e "  ${WHITE}10)${NC} ${RED}Exit${NC}"
         echo ""
         draw_line
-        read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-8]: " OPTION
+        read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-10]: " OPTION
         draw_line
         echo ""
 
@@ -535,7 +910,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             5) update_site ;;
             6) clear_cache ;;
             7) configure_proxy ;;
-            8) echo -e "  ${DIM}Goodbye!${NC}\n"; exit 0 ;;
+            8) configure_proxy_all ;;
+            9) remove_proxy_all ;;
+            10) echo -e "  ${DIM}Goodbye!${NC}\n"; exit 0 ;;
             *) print_err "Invalid option. Please try again." ;;
         esac
 

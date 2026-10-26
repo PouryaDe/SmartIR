@@ -52,6 +52,10 @@ This document establishes the architecture, network behaviors, security guidelin
   - **VPN Clients & API Consumers**: **MUST return HTTP 502 Bad Gateway**. VPN apps treat 502 as a temporary network failure and preserve existing working proxies. Returning HTTP 200 with empty configs causes apps to delete all stored servers.
   - **Genuine Web Browsers**: Return HTML redirect with 0-second meta-refresh and JS redirect to the panel web URL.
 
+### E. Multi-Domain Management & Proxy Configuration
+- **SmartLink Domain Isolation**: Only Nginx vhosts with valid SmartLink document roots (containing `config.php` with `API_DOMAIN` or SmartLink `index.php`) are displayed or managed. Non-SmartLink sites (e.g. WordPress, panels, static sites) hosted on the same server are strictly isolated and protected from accidental modification or deletion.
+- **Proxy Management**: Supports per-domain proxy inspection, individual proxy configuration, batch application across all SmartLink domains, and batch proxy removal.
+
 ---
 
 ## 4. Verification & Testing Runbook
@@ -67,4 +71,5 @@ php -l index.php
 php -l Route.php
 ```
 
-All 85+ unit tests must pass cleanly.
+All 90+ unit tests must pass cleanly.
+
