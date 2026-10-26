@@ -1139,16 +1139,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo -e "  ${WHITE}2)${NC}  ${CYAN}Add a New Site${NC}"
         echo -e "  ${WHITE}3)${NC}  ${CYAN}List Sites & Status${NC}"
         echo -e "  ${WHITE}4)${NC}  ${CYAN}Delete a Site${NC}"
-        echo -e "  ${WHITE}5)${NC}  ${CYAN}Update Source Code (Single Site)${NC}"
-        echo -e "  ${WHITE}6)${NC}  ${CYAN}Update Source Code (All Sites)${NC}"
-        echo -e "  ${WHITE}7)${NC}  ${YELLOW}Clear Cache (Single / All Sites)${NC}"
-        echo -e "  ${WHITE}8)${NC}  ${YELLOW}Configure Proxy (Single Domain)${NC}"
-        echo -e "  ${WHITE}9)${NC}  ${YELLOW}Configure Proxy (All Domains)${NC}"
-        echo -e "  ${WHITE}10)${NC} ${YELLOW}Remove Proxy from ALL Domains${NC}"
-        echo -e "  ${WHITE}11)${NC} ${RED}Exit${NC}"
+        echo -e "  ${WHITE}5)${NC}  ${CYAN}Update Source Code${NC}"
+        echo -e "  ${WHITE}6)${NC}  ${YELLOW}Clear Cache${NC}"
+        echo -e "  ${WHITE}7)${NC}  ${YELLOW}Configure Proxy${NC}"
+        echo -e "  ${WHITE}8)${NC}  ${RED}Exit${NC}"
         echo ""
         draw_line
-        read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-11]: " OPTION
+        read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-8]: " OPTION
         draw_line
         echo ""
 
@@ -1158,12 +1155,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             3) list_sites ;;
             4) delete_site ;;
             5) update_site ;;
-            6) update_all_sites ;;
-            7) clear_cache ;;
-            8) configure_proxy ;;
-            9) configure_proxy_all ;;
-            10) remove_proxy_all ;;
-            11) echo -e "  ${DIM}Goodbye!${NC}\n"; exit 0 ;;
+            6) clear_cache ;;
+            7) configure_proxy ;;
+            8) echo -e "  ${DIM}Goodbye!${NC}\n"; exit 0 ;;
             *) print_err "Invalid option. Please try again." ;;
         esac
 
