@@ -60,6 +60,7 @@ This document establishes the architecture, network behaviors, security guidelin
 - **SmartLink Domain Isolation**: Only Nginx vhosts with valid SmartLink document roots (containing `config.php` with `API_DOMAIN` or SmartLink `index.php`) are displayed or managed. Non-SmartLink sites (e.g. WordPress, panels, static sites) hosted on the same server are strictly isolated and protected from accidental modification or deletion.
 - **Proxy Management**: Supports per-domain proxy inspection, individual proxy configuration, batch application across all SmartLink domains, and batch proxy removal.
 - **Bulk Source Updates**: Supports updating single sites or all SmartLink sites simultaneously. Downloads the GitHub release archive once into a temporary staging area to maximize speed, validates domains, safely replaces source files while strictly preserving existing `cache/` (preventing cache loss for active subscriptions) and restoring `config.php` (`API_DOMAIN`, `APP_DEBUG`, `PROXY_URL`), reloads PHP-FPM OPcache, and enforces standard directory/cache permissions (755 / 777).
+- **Cache & Security Management**: Supports per-site and bulk cache clearing across all domains with live file count detection. Site creation includes HTTP/2 multiplexing, TLS session caching, and hardened security headers (`X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`).
 
 ---
 

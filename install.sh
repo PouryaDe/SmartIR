@@ -10,7 +10,7 @@ WHITE='\033[1;37m'
 DIM='\033[2m'
 NC='\033[0m'
 
-VERSION="3.0"
+VERSION="3.1"
 
 function print_msg()  { echo -e "${GREEN}  ✔  $1${NC}"; }
 function print_err()  { echo -e "${RED}  ✘  $1${NC}"; }
@@ -18,6 +18,10 @@ function print_info() { echo -e "${CYAN}  ➜  $1${NC}"; }
 
 function draw_line() {
     echo -e "${DIM}──────────────────────────────────────────────${NC}"
+}
+
+function reload_php_fpm() {
+    systemctl reload php8.1-fpm 2>/dev/null || systemctl reload php8.2-fpm 2>/dev/null || systemctl reload php-fpm 2>/dev/null || true
 }
 
 function check_root() {
@@ -64,13 +68,18 @@ function install_prerequisites() {
 
     systemctl enable php8.1-fpm --now
 
-    print_msg "Ensuring IPv6 is enabled for optimal international connectivity..."
+    print_msg "Ensuring IPv6 and kernel networking optimizations..."
     sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
     sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
     cat > /etc/sysctl.d/99-smartlink.conf <<EOF
 net.ipv6.conf.all.disable_ipv6 = 0
 net.ipv6.conf.default.disable_ipv6 = 0
 net.ipv6.conf.lo.disable_ipv6 = 0
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
 EOF
     sysctl -p /etc/sysctl.d/99-smartlink.conf >/dev/null 2>&1
     print_msg "Optimizing Nginx and PHP-FPM settings based on server resources..."
@@ -98,15 +107,50 @@ EOF
         sed -i "s/pm.start_servers = .*/pm.start_servers = $START_SERVERS/" $FPM_CONF
         sed -i "s/pm.min_spare_servers = .*/pm.min_spare_servers = $MIN_SPARE/" $FPM_CONF
         sed -i "s/pm.max_spare_servers = .*/pm.max_spare_servers = $MAX_SPARE/" $FPM_CONF
-        systemctl reload php8.1-fpm
+        reload_php_fpm
     fi
     systemctl reload nginx
 
     print_msg "Prerequisites installed successfully!"
 }
 
+# Downloads and extracts the latest SmartIR release from GitHub into a target directory.
+# Arguments:
+#   $1 - Target directory path
+# Returns:
+#   0 on success, 1 on failure
+function download_smartlink_source() {
+    local target_dir="$1"
+    print_msg "Downloading latest release from GitHub..."
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    if wget -q https://github.com/PouryaDe/SmartIR/archive/refs/heads/main.zip -O "$tmp_dir/smartir.zip"; then
+        unzip -q "$tmp_dir/smartir.zip" -d "$tmp_dir"
+        
+        # Clean dev, test, and dependency files
+        rm -rf "$tmp_dir/SmartIR-main/tests" \
+               "$tmp_dir/SmartIR-main/phpunit.xml" \
+               "$tmp_dir/SmartIR-main/.phpunit.cache" \
+               "$tmp_dir/SmartIR-main/.vscode" \
+               "$tmp_dir/SmartIR-main/.git" \
+               "$tmp_dir/SmartIR-main/.gitignore" \
+               "$tmp_dir/SmartIR-main/composer.json" \
+               "$tmp_dir/SmartIR-main/composer.lock"
+
+        mkdir -p "$target_dir"
+        cp -r "$tmp_dir/SmartIR-main/." "$target_dir/"
+        rm -rf "$tmp_dir"
+        return 0
+    else
+        rm -rf "$tmp_dir"
+        print_err "Failed to download update from GitHub."
+        return 1
+    fi
+}
+
 function add_site() {
-    read -p "Enter Domain Name (e.g., example.com): " DOMAIN
+    print_info "Add a New SmartLink Site"
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Enter Domain Name (e.g., example.com): " DOMAIN
     DOMAIN=$(echo "$DOMAIN" | tr '[:upper:]' '[:lower:]' | xargs)
     if [ -z "$DOMAIN" ]; then
         print_err "Domain cannot be empty."
@@ -117,7 +161,7 @@ function add_site() {
         return
     fi
 
-    read -p "Enter API Domain Name (e.g., api.example.com): " API_DOMAIN
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Enter API Domain Name (e.g., api.example.com): " API_DOMAIN
     API_DOMAIN=$(echo "$API_DOMAIN" | tr '[:upper:]' '[:lower:]' | xargs)
     if [ -z "$API_DOMAIN" ]; then
         print_err "API Domain cannot be empty."
@@ -128,31 +172,18 @@ function add_site() {
         return
     fi
 
-    DOC_ROOT="/var/www/$DOMAIN"
+    local DOC_ROOT="/var/www/$DOMAIN"
 
     if [ -d "$DOC_ROOT" ]; then
         print_err "Directory $DOC_ROOT already exists."
         return
     fi
 
-    print_msg "Downloading project from GitHub..."
-    TMP_DIR=$(mktemp -d)
-    if wget -q https://github.com/PouryaDe/SmartIR/archive/refs/heads/main.zip -O "$TMP_DIR/smartir.zip"; then
-        unzip -q "$TMP_DIR/smartir.zip" -d "$TMP_DIR"
-        mv "$TMP_DIR/SmartIR-main" "$DOC_ROOT"
-        rm -rf "$TMP_DIR"
-    else
-        print_err "Failed to download project from GitHub."
-        rm -rf "$TMP_DIR"
-        return
+    if ! download_smartlink_source "$DOC_ROOT"; then
+        print_err "Failed to install site files."
+        rm -rf "$DOC_ROOT"
+        return 1
     fi
-
-    # Remove dev, test, and dependency files from public docroot
-    rm -rf "$DOC_ROOT/tests" "$DOC_ROOT/phpunit.xml" "$DOC_ROOT/.phpunit.cache" \
-           "$DOC_ROOT/.vscode" "$DOC_ROOT/.git" "$DOC_ROOT/.gitignore" \
-           "$DOC_ROOT/composer.json" "$DOC_ROOT/composer.lock"
-
-    chown -R www-data:www-data "$DOC_ROOT"
 
     print_msg "Configuring config.php for API Domain..."
     cat > "$DOC_ROOT/config.php" <<EOF
@@ -161,16 +192,17 @@ define('API_DOMAIN', '$API_DOMAIN');
 define('APP_DEBUG', false);
 define('PROXY_URL', '');
 EOF
-    chown www-data:www-data "$DOC_ROOT/config.php"
 
-    print_msg "Creating cache directory..."
     mkdir -p "$DOC_ROOT/cache"
-    chown www-data:www-data "$DOC_ROOT/cache"
+    chmod -R 755 "$DOC_ROOT"
+    chmod 644 "$DOC_ROOT/config.php"
+    chmod -R 777 "$DOC_ROOT/cache"
+    chown -R www-data:www-data "$DOC_ROOT"
 
     print_msg "Obtaining SSL Certificate for $DOMAIN..."
     systemctl stop nginx 2>/dev/null
     certbot certonly --standalone --preferred-challenges http --agree-tos -d "$DOMAIN" \
-            --register-unsafely-without-email \
+            --register-unsafely-without-email --non-interactive \
             --pre-hook "systemctl stop nginx" \
             --post-hook "systemctl start nginx"
     CERT_STATUS=$?
@@ -179,7 +211,7 @@ EOF
     if [ $CERT_STATUS -ne 0 ] || [ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
         print_err "Failed to obtain SSL certificate for $DOMAIN. Setup aborted."
         rm -rf "$DOC_ROOT"
-        return
+        return 1
     fi
 
     print_msg "Creating Nginx configuration..."
@@ -197,19 +229,27 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name $DOMAIN;
     charset utf-8;
     
     root $DOC_ROOT;
-    index index.php index.html index.htm index.nginx-debian.html;
+    index index.php index.html index.htm;
     autoindex off;
     
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Security Headers
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
 
     location ~ \.php$ {
          include snippets/fastcgi-php.conf;
@@ -225,7 +265,7 @@ server {
     location = /favicon.ico { log_not_found off; access_log off; }
     location = /robots.txt { log_not_found off; access_log off; allow all; }
     
-    location ~* \.(css|gif|ico|jpeg|jpg|js|png)$ {
+    location ~* \.(css|gif|ico|jpeg|jpg|js|png|webp|svg)$ {
         expires max;
         log_not_found off;
     }
@@ -234,7 +274,7 @@ server {
         deny all;
     }
     
-    location ~* \.(sh|md)$ {
+    location ~* \.(sh|md|sql|log)$ {
         deny all;
     }
     
@@ -320,7 +360,9 @@ function is_smartlink_site() {
     [ -f "$doc_root/index.php" ] || return 1
 
     # Must contain API_DOMAIN in config.php (current) or index.php (legacy)
-    if [ -f "$doc_root/config.php" ] && grep -q "API_DOMAIN" "$doc_root/config.php" 2>/dev/null; then
+    if [ -f "$doc_root/config.php" ] && grep -qE "^\s*define\s*\(\s*['\"]API_DOMAIN['\"]" "$doc_root/config.php" 2>/dev/null; then
+        return 0
+    elif [ -f "$doc_root/config.php" ] && grep -q "API_DOMAIN" "$doc_root/config.php" 2>/dev/null; then
         return 0
     elif grep -q "API_DOMAIN" "$doc_root/index.php" 2>/dev/null; then
         return 0
@@ -364,7 +406,10 @@ function get_site_proxy() {
 
     if [ -f "$config_file" ]; then
         local p
-        p=$(grep "PROXY_URL" "$config_file" 2>/dev/null | sed -n "s/.*PROXY_URL['\"]\s*,\s*['\"]\([^'\"]*\)['\"].*/\1/p" | head -n 1)
+        p=$(grep -E "^\s*define\s*\(\s*['\"]PROXY_URL['\"]" "$config_file" 2>/dev/null | sed -n "s/.*PROXY_URL['\"]\s*,\s*['\"]\([^'\"]*\)['\"].*/\1/p" | head -n 1)
+        if [ -z "$p" ]; then
+            p=$(grep "PROXY_URL" "$config_file" 2>/dev/null | sed -n "s/.*PROXY_URL['\"]\s*,\s*['\"]\([^'\"]*\)['\"].*/\1/p" | head -n 1)
+        fi
         if [ -z "$p" ]; then
             p=$(grep "define('PROXY_URL'" "$config_file" 2>/dev/null | awk -F"'" '{print $4}' | head -n 1)
         fi
@@ -385,7 +430,10 @@ function get_site_api() {
 
     if [ -f "$config_file" ]; then
         local a
-        a=$(grep "API_DOMAIN" "$config_file" 2>/dev/null | sed -n "s/.*API_DOMAIN['\"]\s*,\s*['\"]\([^'\"]*\)['\"].*/\1/p" | head -n 1)
+        a=$(grep -E "^\s*define\s*\(\s*['\"]API_DOMAIN['\"]" "$config_file" 2>/dev/null | sed -n "s/.*API_DOMAIN['\"]\s*,\s*['\"]\([^'\"]*\)['\"].*/\1/p" | head -n 1)
+        if [ -z "$a" ]; then
+            a=$(grep "API_DOMAIN" "$config_file" 2>/dev/null | sed -n "s/.*API_DOMAIN['\"]\s*,\s*['\"]\([^'\"]*\)['\"].*/\1/p" | head -n 1)
+        fi
         if [ -z "$a" ]; then
             a=$(grep "define('API_DOMAIN'" "$config_file" 2>/dev/null | awk -F"'" '{print $4}' | head -n 1)
         fi
@@ -426,7 +474,9 @@ function set_site_proxy() {
 
     local current_debug="false"
     if [ -f "$config_file" ]; then
-        if grep -iqE "define\(['\"]APP_DEBUG['\"],\s*true\)" "$config_file" 2>/dev/null; then
+        if grep -iqE "^\s*define\s*\(\s*['\"]APP_DEBUG['\"],\s*true\)" "$config_file" 2>/dev/null; then
+            current_debug="true"
+        elif grep -iqE "define\(['\"]APP_DEBUG['\"],\s*true\)" "$config_file" 2>/dev/null; then
             current_debug="true"
         fi
     fi
@@ -437,6 +487,7 @@ define('API_DOMAIN', '$current_api');
 define('APP_DEBUG', $current_debug);
 define('PROXY_URL', '$new_proxy');
 EOF
+    chmod 644 "$config_file" 2>/dev/null || true
     chown www-data:www-data "$config_file" 2>/dev/null || true
     return 0
 }
@@ -458,22 +509,32 @@ function list_sites() {
         p=$(get_site_proxy "$d")
         local api
         api=$(get_site_api "$d")
+        local doc_root
+        doc_root=$(get_doc_root "$d")
+        local cache_count=0
+        if [ -d "$doc_root/cache" ]; then
+            cache_count=$(find "$doc_root/cache" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+        fi
         local num=$((i + 1))
 
         if [ -n "$p" ]; then
-            echo -e "  ${WHITE}[$num]${NC} ${CYAN}$d${NC} ${DIM}➜${NC} Proxy: ${GREEN}$p${NC}"
+            echo -e "  ${WHITE}[$num]${NC} ${CYAN}$d${NC}"
+            echo -e "      ${DIM}↳ API Domain :${NC} ${WHITE}$api${NC}"
+            echo -e "      ${DIM}↳ Routing    :${NC} ${GREEN}Proxy ($p)${NC}"
+            echo -e "      ${DIM}↳ Cache      :${NC} ${YELLOW}$cache_count cached subscription(s)${NC}"
         else
-            echo -e "  ${WHITE}[$num]${NC} ${CYAN}$d${NC} ${DIM}➜${NC} Proxy: ${YELLOW}None (Direct)${NC}"
+            echo -e "  ${WHITE}[$num]${NC} ${CYAN}$d${NC}"
+            echo -e "      ${DIM}↳ API Domain :${NC} ${WHITE}$api${NC}"
+            echo -e "      ${DIM}↳ Routing    :${NC} ${YELLOW}Direct (No Proxy)${NC}"
+            echo -e "      ${DIM}↳ Cache      :${NC} ${YELLOW}$cache_count cached subscription(s)${NC}"
         fi
-        if [ -n "$api" ]; then
-            echo -e "      ${DIM}↳ API Domain: $api${NC}"
-        fi
+        echo ""
     done
     draw_line
 }
 
 function delete_site() {
-    print_msg "Currently installed SmartLink sites:"
+    print_info "Delete a SmartLink Site"
     mapfile -t domains < <(get_smartlink_domains)
     
     if [ ${#domains[@]} -eq 0 ]; then
@@ -481,25 +542,40 @@ function delete_site() {
         return
     fi
 
-    echo "Select a Domain to delete:"
-    select DOMAIN in "${domains[@]}" "Cancel"; do
-        if [ "$DOMAIN" == "Cancel" ]; then
-            print_msg "Aborted."
-            return
-        elif [ -n "$DOMAIN" ]; then
-            break
-        else
-            print_err "Invalid selection. Please try again."
-        fi
+    echo ""
+    echo -e "  ${CYAN}Select a domain to delete:${NC}"
+    for i in "${!domains[@]}"; do
+        local d="${domains[$i]}"
+        local api
+        api=$(get_site_api "$d")
+        echo -e "  ${WHITE}$((i+1)))${NC} ${RED}$d${NC} ${DIM}(API: $api)${NC}"
     done
+    local cancel_opt=$(( ${#domains[@]} + 1 ))
+    echo -e "  ${WHITE}$cancel_opt)${NC} ${CYAN}Cancel${NC}"
+    echo ""
 
-    read -p "Are you sure you want to completely delete $DOMAIN? [y/N]: " CONFIRM
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-$cancel_opt]: " CHOICE
+
+    if [ "$CHOICE" == "$cancel_opt" ] || [ "$CHOICE" == "c" ] || [ "$CHOICE" == "C" ]; then
+        print_msg "Aborted."
+        return
+    fi
+
+    if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "${#domains[@]}" ]; then
+        print_err "Invalid selection. Please try again."
+        return
+    fi
+
+    local DOMAIN="${domains[$((CHOICE - 1))]}"
+
+    echo ""
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Are you sure you want to COMPLETELY delete $DOMAIN? [y/N]: " CONFIRM
     if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
         print_msg "Aborted."
         return
     fi
 
-    if [ -z "$DOMAIN" ] || [ "$DOMAIN" == "/" ]; then
+    if [ -z "$DOMAIN" ] || ! validate_domain "$DOMAIN"; then
         print_err "Invalid domain selection."
         return
     fi
@@ -511,51 +587,18 @@ function delete_site() {
     print_msg "Removing web directory..."
     local doc_root
     doc_root=$(get_doc_root "$DOMAIN")
-    if [ -n "$doc_root" ] && [ "$doc_root" != "/" ] && [ "$doc_root" != "/var/www" ]; then
-        rm -rf "$doc_root"
+    local base_www="${SMARTLINK_VAR_WWW:-/var/www}"
+    if [ -n "$doc_root" ] && [ "$doc_root" != "/" ] && [ "$doc_root" != "$base_www" ] && [ -d "$doc_root" ]; then
+        rm -rf "${doc_root:?}"
     fi
 
     print_msg "Revoking SSL certificate..."
     certbot delete --cert-name "$DOMAIN" --non-interactive 2>/dev/null
 
     print_msg "Reloading Nginx..."
-    systemctl reload nginx
+    systemctl reload nginx 2>/dev/null || true
 
     print_msg "Site $DOMAIN deleted successfully."
-}
-
-# Downloads and extracts the latest SmartIR release from GitHub into a target directory.
-# Arguments:
-#   $1 - Target directory path
-# Returns:
-#   0 on success, 1 on failure
-function download_smartlink_source() {
-    local target_dir="$1"
-    print_msg "Downloading latest release from GitHub..."
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    if wget -q https://github.com/PouryaDe/SmartIR/archive/refs/heads/main.zip -O "$tmp_dir/smartir.zip"; then
-        unzip -q "$tmp_dir/smartir.zip" -d "$tmp_dir"
-        
-        # Clean dev, test, and dependency files
-        rm -rf "$tmp_dir/SmartIR-main/tests" \
-               "$tmp_dir/SmartIR-main/phpunit.xml" \
-               "$tmp_dir/SmartIR-main/.phpunit.cache" \
-               "$tmp_dir/SmartIR-main/.vscode" \
-               "$tmp_dir/SmartIR-main/.git" \
-               "$tmp_dir/SmartIR-main/.gitignore" \
-               "$tmp_dir/SmartIR-main/composer.json" \
-               "$tmp_dir/SmartIR-main/composer.lock"
-
-        mkdir -p "$target_dir"
-        cp -r "$tmp_dir/SmartIR-main/." "$target_dir/"
-        rm -rf "$tmp_dir"
-        return 0
-    else
-        rm -rf "$tmp_dir"
-        print_err "Failed to download update from GitHub."
-        return 1
-    fi
 }
 
 # Updates files for a single SmartLink domain from a prepared source directory.
@@ -582,13 +625,15 @@ function perform_site_update() {
     local current_api
     current_api=$(get_site_api "$domain")
 
-    if [ -z "$current_api" ] || [ "$current_api" == "API_DOMAIN_PLACEHOLDER" ]; then
+    if [ -z "$current_api" ] || [ "$current_api" == "API_DOMAIN_PLACEHOLDER" ] || ! validate_domain "$current_api"; then
         current_api="example.com"
     fi
 
     local current_debug="false"
     if [ -f "$doc_root/config.php" ]; then
-        if grep -iqE "define\(['\"]APP_DEBUG['\"],\s*true\)" "$doc_root/config.php" 2>/dev/null; then
+        if grep -iqE "^\s*define\s*\(\s*['\"]APP_DEBUG['\"],\s*true\)" "$doc_root/config.php" 2>/dev/null; then
+            current_debug="true"
+        elif grep -iqE "define\(['\"]APP_DEBUG['\"],\s*true\)" "$doc_root/config.php" 2>/dev/null; then
             current_debug="true"
         fi
     fi
@@ -620,6 +665,7 @@ define('PROXY_URL', '$current_proxy');
 EOF
 
     chmod -R 755 "$doc_root" 2>/dev/null || true
+    chmod 644 "$doc_root/config.php" 2>/dev/null || true
     chmod -R 777 "$doc_root/cache" 2>/dev/null || true
     chown -R www-data:www-data "$doc_root" 2>/dev/null || true
     return 0
@@ -677,7 +723,7 @@ function update_site() {
     print_info "Updating $DOMAIN..."
     if perform_site_update "$DOMAIN" "$prep_dir"; then
         print_msg "Clearing PHP OPcache..."
-        systemctl reload php8.1-fpm 2>/dev/null || true
+        reload_php_fpm
         print_msg "Site $DOMAIN updated successfully!"
     else
         print_err "Failed to update $DOMAIN."
@@ -733,14 +779,14 @@ function update_all_sites() {
     rm -rf "$prep_dir"
 
     print_msg "Clearing PHP OPcache..."
-    systemctl reload php8.1-fpm 2>/dev/null || true
+    reload_php_fpm
 
     echo ""
     print_msg "Update complete: $updated_count of ${#domains[@]} site(s) updated successfully!"
 }
 
 function clear_cache() {
-    print_info "Currently installed SmartLink sites:"
+    print_info "Clear Subscription Cache"
     mapfile -t domains < <(get_smartlink_domains)
 
     if [ ${#domains[@]} -eq 0 ]; then
@@ -750,17 +796,40 @@ function clear_cache() {
 
     echo ""
     echo -e "  ${CYAN}Select a domain to clear its cache:${NC}"
-    select DOMAIN in "${domains[@]}" "Cancel"; do
-        if [ "$DOMAIN" == "Cancel" ]; then
-            print_msg "Aborted."
-            return
-        elif [ -n "$DOMAIN" ]; then
-            break
-        else
-            print_err "Invalid selection. Please try again."
+    for i in "${!domains[@]}"; do
+        local d="${domains[$i]}"
+        local doc_root
+        doc_root=$(get_doc_root "$d")
+        local file_count=0
+        if [ -d "$doc_root/cache" ]; then
+            file_count=$(find "$doc_root/cache" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
         fi
+        echo -e "  ${WHITE}$((i+1)))${NC} $d ${DIM}($file_count cached files)${NC}"
     done
+    local all_opt=$(( ${#domains[@]} + 1 ))
+    local cancel_opt=$(( ${#domains[@]} + 2 ))
+    echo -e "  ${WHITE}$all_opt)${NC} ${CYAN}[Clear cache for ALL sites]${NC}"
+    echo -e "  ${WHITE}$cancel_opt)${NC} ${RED}Cancel${NC}"
+    echo ""
 
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-$cancel_opt]: " CHOICE
+
+    if [ "$CHOICE" == "$cancel_opt" ] || [ "$CHOICE" == "c" ] || [ "$CHOICE" == "C" ]; then
+        print_msg "Aborted."
+        return
+    fi
+
+    if [ "$CHOICE" == "$all_opt" ] || [ "$CHOICE" == "a" ] || [ "$CHOICE" == "A" ]; then
+        clear_cache_all
+        return
+    fi
+
+    if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "${#domains[@]}" ]; then
+        print_err "Invalid selection. Please try again."
+        return
+    fi
+
+    local DOMAIN="${domains[$((CHOICE - 1))]}"
     local doc_root
     doc_root=$(get_doc_root "$DOMAIN")
     local CACHE_DIR="$doc_root/cache"
@@ -770,7 +839,8 @@ function clear_cache() {
         return
     fi
 
-    FILE_COUNT=$(find "$CACHE_DIR" -name '*.json' 2>/dev/null | wc -l)
+    local FILE_COUNT
+    FILE_COUNT=$(find "$CACHE_DIR" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
 
     if [ "$FILE_COUNT" -eq 0 ]; then
         print_info "Cache is already empty for $DOMAIN."
@@ -779,6 +849,42 @@ function clear_cache() {
 
     rm -f "$CACHE_DIR"/*.json
     print_msg "Cleared $FILE_COUNT cached file(s) for $DOMAIN."
+}
+
+# Clears subscription cache for all SmartLink domains at once.
+function clear_cache_all() {
+    print_info "Clear Cache for ALL SmartLink Sites"
+    mapfile -t domains < <(get_smartlink_domains)
+
+    if [ ${#domains[@]} -eq 0 ]; then
+        print_err "No SmartLink sites found."
+        return
+    fi
+
+    echo ""
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Are you sure you want to clear cache for ALL ${#domains[@]} site(s)? [y/N]: " CONFIRM
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+        print_msg "Aborted."
+        return
+    fi
+
+    local total_cleared=0
+    for d in "${domains[@]}"; do
+        local doc_root
+        doc_root=$(get_doc_root "$d")
+        local cache_dir="$doc_root/cache"
+        if [ -d "$cache_dir" ]; then
+            local count
+            count=$(find "$cache_dir" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+            if [ "$count" -gt 0 ]; then
+                rm -f "$cache_dir"/*.json
+                total_cleared=$((total_cleared + count))
+            fi
+        fi
+    done
+
+    echo ""
+    print_msg "Cleared a total of $total_cleared cached file(s) across all ${#domains[@]} site(s)."
 }
 
 # Configures proxy for a single selected SmartLink domain.
@@ -815,7 +921,7 @@ function configure_single_domain_proxy() {
     fi
 
     if set_site_proxy "$DOMAIN" "$NEW_PROXY"; then
-        systemctl reload php8.1-fpm 2>/dev/null || true
+        reload_php_fpm
         if [ -z "$NEW_PROXY" ]; then
             print_msg "Proxy removed for $DOMAIN."
         else
@@ -940,7 +1046,7 @@ function configure_proxy_all() {
     done
 
     if [ "$updated_count" -gt 0 ]; then
-        systemctl reload php8.1-fpm 2>/dev/null || true
+        reload_php_fpm
     fi
 
     echo ""
@@ -1000,7 +1106,7 @@ function remove_proxy_all() {
     done
 
     if [ "$removed_count" -gt 0 ]; then
-        systemctl reload php8.1-fpm 2>/dev/null || true
+        reload_php_fpm
     fi
 
     echo ""
@@ -1014,17 +1120,28 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         clear
         echo ""
         echo -e "  ${BLUE}╔══════════════════════════════════════════════╗${NC}"
-        echo -e "  ${BLUE}║${WHITE}      SmartLink Installer & Manager          ${BLUE}║${NC}"
-        echo -e "  ${BLUE}║${DIM}                    v${VERSION}                        ${BLUE}║${NC}"
+        echo -e "  ${BLUE}║${WHITE}       SmartLink Installer & Manager          ${BLUE}║${NC}"
+        echo -e "  ${BLUE}║${DIM}                     v${VERSION}                     ${BLUE}║${NC}"
+        
+        mapfile -t detected_domains < <(get_smartlink_domains 2>/dev/null)
+        total_sites=${#detected_domains[@]}
+        proxy_count=0
+        for sd in "${detected_domains[@]}"; do
+            [ -n "$(get_site_proxy "$sd")" ] && proxy_count=$((proxy_count + 1))
+        done
+        direct_count=$((total_sites - proxy_count))
+
+        echo -e "  ${BLUE}╟──────────────────────────────────────────────╢${NC}"
+        printf "  ${BLUE}║${NC}  ${CYAN}Sites:${NC} %-3d ${BLUE}│${NC}  ${GREEN}Proxy:${NC} %-3d ${BLUE}│${NC}  ${YELLOW}Direct:${NC} %-3d      ${BLUE}║${NC}\n" "$total_sites" "$proxy_count" "$direct_count"
         echo -e "  ${BLUE}╚══════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${WHITE}1)${NC}  ${CYAN}Install Prerequisites${NC}"
         echo -e "  ${WHITE}2)${NC}  ${CYAN}Add a New Site${NC}"
-        echo -e "  ${WHITE}3)${NC}  ${CYAN}List Sites & Proxies${NC}"
+        echo -e "  ${WHITE}3)${NC}  ${CYAN}List Sites & Status${NC}"
         echo -e "  ${WHITE}4)${NC}  ${CYAN}Delete a Site${NC}"
         echo -e "  ${WHITE}5)${NC}  ${CYAN}Update Source Code (Single Site)${NC}"
         echo -e "  ${WHITE}6)${NC}  ${CYAN}Update Source Code (All Sites)${NC}"
-        echo -e "  ${WHITE}7)${NC}  ${YELLOW}Clear Cache${NC}"
+        echo -e "  ${WHITE}7)${NC}  ${YELLOW}Clear Cache (Single / All Sites)${NC}"
         echo -e "  ${WHITE}8)${NC}  ${YELLOW}Configure Proxy (Single Domain)${NC}"
         echo -e "  ${WHITE}9)${NC}  ${YELLOW}Configure Proxy (All Domains)${NC}"
         echo -e "  ${WHITE}10)${NC} ${YELLOW}Remove Proxy from ALL Domains${NC}"
