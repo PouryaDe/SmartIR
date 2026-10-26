@@ -191,30 +191,38 @@ function fetchJsonFromUrl(string $apiUrl, bool $allowStaleOnFailure = false): ?a
     }
 
     // Build connection attempts:
-    // Attempt 1: Direct connection first (IPv4 prioritized to avoid 5-second IPv6 blackhole hanging in Iranian datacenters)
-    $attempts = [
-        [
-            'use_proxy'       => false,
-            'ip_resolve'      => CURL_IPRESOLVE_V4,
-            'connect_timeout' => 4,
-            'timeout'         => 7,
-        ]
-    ];
-
-    // Attempt 2: Proxy fallback if configured, otherwise IPv6 fallback if direct IPv4 fails
+    // If PROXY_URL is defined, prioritize the proxy route (Attempt 1) so clients receive instant responses
+    // without suffering through 4-7s dead direct connection timeouts. Falls back to direct IPv4.
     if ($proxyUrl !== '') {
-        $attempts[] = [
-            'use_proxy'       => true,
-            'ip_resolve'      => CURL_IPRESOLVE_WHATEVER,
-            'connect_timeout' => 5,
-            'timeout'         => 10,
+        $attempts = [
+            [
+                'use_proxy'       => true,
+                'ip_resolve'      => CURL_IPRESOLVE_V4,
+                'connect_timeout' => 4,
+                'timeout'         => 8,
+            ],
+            [
+                'use_proxy'       => false,
+                'ip_resolve'      => CURL_IPRESOLVE_V4,
+                'connect_timeout' => 3,
+                'timeout'         => 6,
+            ],
         ];
     } else {
-        $attempts[] = [
-            'use_proxy'       => false,
-            'ip_resolve'      => CURL_IPRESOLVE_V6,
-            'connect_timeout' => 4,
-            'timeout'         => 7,
+        // If no proxy is defined, prioritize Direct IPv4, falling back to Direct IPv6.
+        $attempts = [
+            [
+                'use_proxy'       => false,
+                'ip_resolve'      => CURL_IPRESOLVE_V4,
+                'connect_timeout' => 4,
+                'timeout'         => 7,
+            ],
+            [
+                'use_proxy'       => false,
+                'ip_resolve'      => CURL_IPRESOLVE_V6,
+                'connect_timeout' => 4,
+                'timeout'         => 7,
+            ],
         ];
     }
 

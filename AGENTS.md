@@ -30,11 +30,15 @@ This document establishes the architecture, network behaviors, security guidelin
 ## 3. Core Behaviors & Critical Rules
 
 ### A. Network Connection Hierarchy
-- **Attempt 1: Direct IPv4 First** (`connect_timeout = 4s`, `timeout = 7s`):
-  Iranian datacenters often suffer from 5-second blackhole timeouts when attempting international IPv6 routing. Prioritizing IPv4 direct connection ensures sub-200ms responses under normal conditions.
-- **Attempt 2: Fallback Route**:
-  - If `PROXY_URL` is defined in `config.php`: Fall back to the configured upstream proxy (SOCKS5 hostname resolution or HTTP proxy) with `connect_timeout = 5s`, `timeout = 10s`.
-  - If `PROXY_URL` is empty: Fall back to direct IPv6 (`CURL_IPRESOLVE_V6`).
+- **When `PROXY_URL` is configured in `config.php`**:
+  - **Attempt 1: Proxy First over IPv4** (`connect_timeout = 4s`, `timeout = 8s`, `CURL_IPRESOLVE_V4`):
+    Bypasses Iranian international censorship, filtering spikes, and dead connection timeouts directly without latency penalty.
+  - **Attempt 2: Direct IPv4 Fallback** (`connect_timeout = 3s`, `timeout = 6s`, `CURL_IPRESOLVE_V4`):
+    Ensures connectivity if the upstream proxy server temporarily drops.
+- **When `PROXY_URL` is empty**:
+  - **Attempt 1: Direct IPv4 First** (`connect_timeout = 4s`, `timeout = 7s`, `CURL_IPRESOLVE_V4`):
+    Avoids 5-second IPv6 blackhole hanging in Iranian datacenters and ensures sub-200ms responses under normal conditions.
+  - **Attempt 2: Direct IPv6 Fallback** (`connect_timeout = 4s`, `timeout = 7s`, `CURL_IPRESOLVE_V6`).
 
 ### B. Client IP Resolution & Anti-Spoofing
 - **Cloudflare**: If `HTTP_CF_CONNECTING_IP` is present, it is trusted and extracted.
