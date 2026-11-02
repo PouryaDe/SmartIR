@@ -10,7 +10,7 @@ WHITE='\033[1;37m'
 DIM='\033[2m'
 NC='\033[0m'
 
-VERSION="3.1"
+VERSION="3.2"
 
 function print_msg()  { echo -e "${GREEN}  ✔  $1${NC}"; }
 function print_err()  { echo -e "${RED}  ✘  $1${NC}"; }
@@ -56,8 +56,8 @@ function install_prerequisites() {
     print_msg "Updating system packages..."
     apt update && apt upgrade -y
 
-    print_msg "Installing essential packages (nginx, certbot, git)..."
-    apt install -y software-properties-common certbot nginx git curl wget unzip
+    print_msg "Installing essential packages (nginx, certbot, git, openssl, cron)..."
+    apt install -y software-properties-common certbot nginx git curl wget unzip openssl cron
 
     print_msg "Adding PHP PPA and installing PHP 8.1..."
     add-apt-repository ppa:ondrej/php -y
@@ -110,6 +110,9 @@ EOF
         reload_php_fpm
     fi
     systemctl reload nginx
+
+    print_msg "Configuring SSL auto-renewal cron job and timer..."
+    setup_ssl_autorenew
 
     print_msg "Prerequisites installed successfully!"
 }
@@ -291,6 +294,7 @@ EOF
     print_msg "Testing Nginx configuration and reloading..."
     if nginx -t; then
         systemctl reload nginx
+        setup_ssl_autorenew
         print_msg "Site $DOMAIN added successfully! API Domain is set to $API_DOMAIN."
     else
         print_err "Nginx configuration test failed. Reverting configuration..."
@@ -303,6 +307,143 @@ EOF
 # ------------------------------------------------------------------------------
 # SmartLink Helper Functions & Domain Discovery
 # ------------------------------------------------------------------------------
+
+# Installs or verifies the automated Let's Encrypt renewal cron job and systemd timer.
+# Ensures certificate checks run twice daily with Nginx stop/start hooks.
+function setup_ssl_autorenew() {
+    local cron_dir="${SMARTLINK_CRON_DIR:-/etc/cron.d}"
+    local cron_file="$cron_dir/smartlink-certbot"
+
+    if [ -d "$cron_dir" ]; then
+        cat > "$cron_file" <<'EOF'
+# IR SmartLink SSL Auto-Renewal Job
+# Automatically checks certificates twice daily and renews any expiring within 30 days
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin:/snap/bin
+
+30 3,15 * * * root certbot renew --pre-hook "systemctl stop nginx" --post-hook "systemctl start nginx" --deploy-hook "systemctl reload nginx" --quiet
+EOF
+        chmod 644 "$cron_file" 2>/dev/null || true
+    fi
+
+    systemctl enable --now certbot.timer 2>/dev/null || true
+    systemctl enable --now cron 2>/dev/null || systemctl enable --now crond 2>/dev/null || true
+    return 0
+}
+
+# Resolves the path to the SSL certificate for a given domain.
+# First checks the domain's Nginx vhost config for ssl_certificate.
+# Falls back to standard /etc/letsencrypt/live/<domain>/fullchain.pem.
+# Arguments:
+#   $1 - Domain name
+# Outputs:
+#   Absolute path to certificate fullchain.pem
+function get_site_ssl_cert() {
+    local domain="$1"
+    local base_nginx="${SMARTLINK_NGINX_CONF_DIR:-/etc/nginx/sites-enabled}"
+    local nginx_conf="$base_nginx/$domain"
+    [ -f "$nginx_conf" ] || nginx_conf="${SMARTLINK_NGINX_AVAIL_DIR:-/etc/nginx/sites-available}/$domain"
+
+    if [ -f "$nginx_conf" ]; then
+        local detected_cert
+        detected_cert=$(grep -E '^\s*ssl_certificate\s+' "$nginx_conf" 2>/dev/null | head -n 1 | awk '{print $2}' | tr -d ';')
+        if [ -n "$detected_cert" ]; then
+            echo "$detected_cert"
+            return 0
+        fi
+    fi
+
+    local le_dir="${SMARTLINK_LE_LIVE_DIR:-/etc/letsencrypt/live}"
+    echo "$le_dir/$domain/fullchain.pem"
+    return 0
+}
+
+# Evaluates certificate validity using OpenSSL.
+# Arguments:
+#   $1 - Domain name
+# Outputs:
+#   Status string: "valid", "expiring", "expired", "missing", or "unknown"
+# Returns:
+#   0 if valid or expiring soon, 1 if expired or invalid, 2 if missing
+function get_ssl_cert_status() {
+    local domain="$1"
+    validate_domain "$domain" || { echo "invalid"; return 1; }
+
+    local cert_file
+    cert_file=$(get_site_ssl_cert "$domain")
+
+    if [ ! -f "$cert_file" ]; then
+        echo "missing"
+        return 2
+    fi
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "unknown"
+        return 0
+    fi
+
+    # Check if certificate is already expired (checkend 0 returns non-zero if expired)
+    if ! openssl x509 -checkend 0 -noout -in "$cert_file" >/dev/null 2>&1; then
+        echo "expired"
+        return 1
+    fi
+
+    # Check if certificate expires within 30 days (2592000 seconds = 30 * 86400)
+    if ! openssl x509 -checkend 2592000 -noout -in "$cert_file" >/dev/null 2>&1; then
+        echo "expiring"
+        return 0
+    fi
+
+    echo "valid"
+    return 0
+}
+
+# Returns human-readable expiration details (days remaining or expired).
+# Arguments:
+#   $1 - Domain name
+# Outputs:
+#   String with remaining/expired days and expiration timestamp
+function get_ssl_expiry_info() {
+    local domain="$1"
+    local cert_file
+    cert_file=$(get_site_ssl_cert "$domain")
+
+    if [ ! -f "$cert_file" ]; then
+        echo "No certificate file found"
+        return 1
+    fi
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "OpenSSL not available"
+        return 1
+    fi
+
+    local raw_date
+    raw_date=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | sed 's/notAfter=//')
+    if [ -z "$raw_date" ]; then
+        echo "Unable to read certificate date"
+        return 1
+    fi
+
+    local exp_epoch
+    exp_epoch=$(date -d "$raw_date" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$raw_date" +%s 2>/dev/null)
+    if [ -n "$exp_epoch" ]; then
+        local now_epoch
+        now_epoch=$(date +%s)
+        local diff_days=$(( (exp_epoch - now_epoch) / 86400 ))
+        if [ "$diff_days" -lt 0 ]; then
+            echo "Expired ($((-diff_days)) day(s) ago - $raw_date)"
+        elif [ "$diff_days" -eq 0 ]; then
+            echo "Expires TODAY ($raw_date)"
+        else
+            echo "$diff_days day(s) remaining ($raw_date)"
+        fi
+        return 0
+    fi
+
+    echo "$raw_date"
+    return 0
+}
 
 # Resolves the document root path for a given domain.
 # First checks standard /var/www/<domain>. If absent, parses Nginx vhost config.
@@ -517,16 +658,35 @@ function list_sites() {
         fi
         local num=$((i + 1))
 
+        local ssl_status
+        ssl_status=$(get_ssl_cert_status "$d")
+        local ssl_info
+        ssl_info=$(get_ssl_expiry_info "$d")
+        local ssl_badge
+        if [ "$ssl_status" == "valid" ]; then
+            ssl_badge="${GREEN}Valid${NC} ${DIM}($ssl_info)${NC}"
+        elif [ "$ssl_status" == "expiring" ]; then
+            ssl_badge="${YELLOW}Expiring Soon${NC} ${DIM}($ssl_info)${NC}"
+        elif [ "$ssl_status" == "expired" ]; then
+            ssl_badge="${RED}EXPIRED${NC} ${DIM}($ssl_info)${NC}"
+        elif [ "$ssl_status" == "missing" ]; then
+            ssl_badge="${RED}Missing Certificate${NC}"
+        else
+            ssl_badge="${YELLOW}Unknown ($ssl_info)${NC}"
+        fi
+
         if [ -n "$p" ]; then
             echo -e "  ${WHITE}[$num]${NC} ${CYAN}$d${NC}"
             echo -e "      ${DIM}↳ API Domain :${NC} ${WHITE}$api${NC}"
             echo -e "      ${DIM}↳ Routing    :${NC} ${GREEN}Proxy ($p)${NC}"
             echo -e "      ${DIM}↳ Cache      :${NC} ${YELLOW}$cache_count cached subscription(s)${NC}"
+            echo -e "      ${DIM}↳ SSL Status :${NC} $ssl_badge"
         else
             echo -e "  ${WHITE}[$num]${NC} ${CYAN}$d${NC}"
             echo -e "      ${DIM}↳ API Domain :${NC} ${WHITE}$api${NC}"
             echo -e "      ${DIM}↳ Routing    :${NC} ${YELLOW}Direct (No Proxy)${NC}"
             echo -e "      ${DIM}↳ Cache      :${NC} ${YELLOW}$cache_count cached subscription(s)${NC}"
+            echo -e "      ${DIM}↳ SSL Status :${NC} $ssl_badge"
         fi
         echo ""
     done
@@ -725,6 +885,11 @@ function update_site() {
         print_msg "Clearing PHP OPcache..."
         reload_php_fpm
         print_msg "Site $DOMAIN updated successfully!"
+
+        echo ""
+        print_info "Checking SSL certificate status for $DOMAIN..."
+        renew_site_ssl "$DOMAIN" "auto"
+        setup_ssl_autorenew
     else
         print_err "Failed to update $DOMAIN."
     fi
@@ -770,6 +935,9 @@ function update_all_sites() {
         print_info "Updating $d..."
         if perform_site_update "$d" "$prep_dir"; then
             print_msg "$d updated successfully."
+            echo ""
+            print_info "Checking SSL certificate status for $d..."
+            renew_site_ssl "$d" "auto"
             updated_count=$((updated_count + 1))
         else
             print_err "Failed to update $d."
@@ -780,6 +948,7 @@ function update_all_sites() {
 
     print_msg "Clearing PHP OPcache..."
     reload_php_fpm
+    setup_ssl_autorenew
 
     echo ""
     print_msg "Update complete: $updated_count of ${#domains[@]} site(s) updated successfully!"
@@ -1113,8 +1282,243 @@ function remove_proxy_all() {
     print_msg "Proxy removed successfully from all $removed_count site(s). All sites now connect directly."
 }
 
+# ------------------------------------------------------------------------------
+# SSL Certificate Management & Renewal Functions
+# ------------------------------------------------------------------------------
+
+# Renews SSL certificate for a specified domain.
+# Arguments:
+#   $1 - Domain name
+#   $2 - Mode ("auto" or "force", default: "auto")
+# Returns:
+#   0 on success or if already valid, 1 on failure
+function renew_site_ssl() {
+    local domain="$1"
+    local mode="${2:-auto}"
+
+    validate_domain "$domain" || {
+        print_err "Invalid domain: $domain"
+        return 1
+    }
+
+    local current_status
+    current_status=$(get_ssl_cert_status "$domain")
+
+    if [ "$mode" != "force" ] && [ "$current_status" == "valid" ]; then
+        local valid_info
+        valid_info=$(get_ssl_expiry_info "$domain")
+        print_msg "SSL certificate for $domain is valid ($valid_info). No renewal needed."
+        return 0
+    fi
+
+    local certbot_bin="${SMARTLINK_CERTBOT_BIN:-certbot}"
+    if ! command -v "$certbot_bin" >/dev/null 2>&1; then
+        print_err "Certbot binary '$certbot_bin' not found. Please install prerequisites first."
+        return 1
+    fi
+
+    if [ "$current_status" == "expired" ]; then
+        print_info "SSL certificate for $domain is EXPIRED! Initiating renewal..."
+    elif [ "$current_status" == "expiring" ]; then
+        print_info "SSL certificate for $domain is expiring soon. Initiating renewal..."
+    elif [ "$current_status" == "missing" ]; then
+        print_info "No SSL certificate found for $domain. Obtaining new certificate..."
+    else
+        print_info "Renewing SSL certificate for $domain (mode: $mode)..."
+    fi
+
+    local renew_success=0
+
+    # Attempt 1: certbot renew for this specific lineage
+    local renew_args=(renew --cert-name "$domain" --non-interactive --pre-hook "systemctl stop nginx" --post-hook "systemctl start nginx")
+    if [ "$mode" == "force" ]; then
+        renew_args+=(--force-renewal)
+    fi
+
+    if "$certbot_bin" "${renew_args[@]}" 2>&1; then
+        renew_success=1
+    fi
+
+    # Attempt 2: If certbot renew failed (e.g. missing lineage/conf), run certonly standalone
+    if [ $renew_success -eq 0 ]; then
+        print_info "Certbot renew did not succeed for $domain. Attempting standalone issuance..."
+        systemctl stop nginx 2>/dev/null || true
+        local certonly_args=(certonly --standalone --preferred-challenges http --agree-tos -d "$domain" \
+                             --register-unsafely-without-email --non-interactive \
+                             --pre-hook "systemctl stop nginx" --post-hook "systemctl start nginx")
+        if [ "$mode" == "force" ]; then
+            certonly_args+=(--force-renewal)
+        fi
+
+        if "$certbot_bin" "${certonly_args[@]}" 2>&1; then
+            renew_success=1
+        fi
+        systemctl start nginx 2>/dev/null || true
+    fi
+
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+
+    local final_status
+    final_status=$(get_ssl_cert_status "$domain")
+    if [ "$final_status" == "valid" ] || [ "$final_status" == "expiring" ]; then
+        local updated_info
+        updated_info=$(get_ssl_expiry_info "$domain")
+        print_msg "SSL certificate for $domain is now active ($updated_info)!"
+        return 0
+    elif [ $renew_success -eq 1 ]; then
+        print_msg "SSL renewal completed for $domain."
+        return 0
+    else
+        print_err "Failed to obtain or renew SSL certificate for $domain."
+        return 1
+    fi
+}
+
+# Renews SSL certificates across all configured SmartLink domains.
+# Arguments:
+#   $1 - Mode ("auto" or "force", default: "auto")
+function renew_all_ssl() {
+    local mode="${1:-auto}"
+    print_info "Processing SSL certificates for all SmartLink sites (mode: $mode)..."
+    mapfile -t domains < <(get_smartlink_domains)
+
+    if [ ${#domains[@]} -eq 0 ]; then
+        print_err "No SmartLink sites found."
+        return
+    fi
+
+    local renewed=0
+    local skipped=0
+    local failed=0
+
+    for d in "${domains[@]}"; do
+        echo ""
+        print_info "Checking $d..."
+        local st
+        st=$(get_ssl_cert_status "$d")
+        if [ "$mode" != "force" ] && [ "$st" == "valid" ]; then
+            local info
+            info=$(get_ssl_expiry_info "$d")
+            print_msg "$d is already valid ($info). Skipping."
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        if renew_site_ssl "$d" "$mode"; then
+            renewed=$((renewed + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    setup_ssl_autorenew
+
+    echo ""
+    draw_line
+    print_msg "SSL Summary: $renewed renewed, $skipped already valid, $failed failed."
+    draw_line
+}
+
+function renew_ssl_menu() {
+    print_info "SSL Certificate Management & Renewal"
+    mapfile -t domains < <(get_smartlink_domains)
+
+    if [ ${#domains[@]} -eq 0 ]; then
+        print_err "No SmartLink sites found."
+        return
+    fi
+
+    echo ""
+    echo -e "  ${CYAN}Installed SmartLink sites & SSL status:${NC}"
+    for i in "${!domains[@]}"; do
+        local d="${domains[$i]}"
+        local ssl_status
+        ssl_status=$(get_ssl_cert_status "$d")
+        local ssl_info
+        ssl_info=$(get_ssl_expiry_info "$d")
+        local num=$((i + 1))
+        if [ "$ssl_status" == "valid" ]; then
+            echo -e "  ${WHITE}$num)${NC} $d ${DIM}➜${NC} ${GREEN}Valid${NC} ${DIM}($ssl_info)${NC}"
+        elif [ "$ssl_status" == "expiring" ]; then
+            echo -e "  ${WHITE}$num)${NC} $d ${DIM}➜${NC} ${YELLOW}Expiring Soon${NC} ${DIM}($ssl_info)${NC}"
+        elif [ "$ssl_status" == "expired" ]; then
+            echo -e "  ${WHITE}$num)${NC} $d ${DIM}➜${NC} ${RED}EXPIRED${NC} ${DIM}($ssl_info)${NC}"
+        elif [ "$ssl_status" == "missing" ]; then
+            echo -e "  ${WHITE}$num)${NC} $d ${DIM}➜${NC} ${RED}Missing Certificate${NC}"
+        else
+            echo -e "  ${WHITE}$num)${NC} $d ${DIM}➜${NC} ${YELLOW}Unknown ($ssl_info)${NC}"
+        fi
+    done
+
+    local auto_renew_opt=$(( ${#domains[@]} + 1 ))
+    local force_all_opt=$(( ${#domains[@]} + 2 ))
+    local setup_cron_opt=$(( ${#domains[@]} + 3 ))
+    local cancel_opt=$(( ${#domains[@]} + 4 ))
+
+    echo ""
+    echo -e "  ${WHITE}$auto_renew_opt)${NC} ${CYAN}[Renew all expired / expiring certificates]${NC}"
+    echo -e "  ${WHITE}$force_all_opt)${NC} ${YELLOW}[Force renew ALL certificates]${NC}"
+    echo -e "  ${WHITE}$setup_cron_opt)${NC} ${GREEN}[Enable / Verify Auto-Renewal Cron Job]${NC}"
+    echo -e "  ${WHITE}$cancel_opt)${NC} ${RED}Cancel${NC}"
+    echo ""
+
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-$cancel_opt]: " CHOICE
+
+    if [ "$CHOICE" == "$cancel_opt" ] || [ "$CHOICE" == "c" ] || [ "$CHOICE" == "C" ]; then
+        print_msg "Aborted."
+        return
+    fi
+
+    if [ "$CHOICE" == "$auto_renew_opt" ] || [ "$CHOICE" == "a" ] || [ "$CHOICE" == "A" ]; then
+        renew_all_ssl "auto"
+        return
+    fi
+
+    if [ "$CHOICE" == "$force_all_opt" ] || [ "$CHOICE" == "f" ] || [ "$CHOICE" == "F" ]; then
+        renew_all_ssl "force"
+        return
+    fi
+
+    if [ "$CHOICE" == "$setup_cron_opt" ]; then
+        setup_ssl_autorenew
+        print_msg "SSL auto-renewal cron job and systemd timer configured successfully!"
+        return
+    fi
+
+    if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "${#domains[@]}" ]; then
+        print_err "Invalid selection. Please try again."
+        return
+    fi
+
+    local SELECTED_DOMAIN="${domains[$((CHOICE - 1))]}"
+    echo ""
+    read -rp "  $(echo -e "${YELLOW}›${NC}") Force renewal even if certificate is currently valid? [y/N]: " FORCE_CHOICE
+    local mode="auto"
+    if [[ "$FORCE_CHOICE" == "y" || "$FORCE_CHOICE" == "Y" ]]; then
+        mode="force"
+    fi
+
+    renew_site_ssl "$SELECTED_DOMAIN" "$mode"
+    setup_ssl_autorenew
+}
+
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     check_root
+
+    case "$1" in
+        --renew-ssl|renew-ssl)
+            renew_all_ssl "${2:-auto}"
+            exit 0
+            ;;
+        --force-renew-ssl|force-renew-ssl)
+            renew_all_ssl "force"
+            exit 0
+            ;;
+        --update|update)
+            update_all_sites
+            exit 0
+            ;;
+    esac
 
     while true; do
         clear
@@ -1126,26 +1530,33 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         mapfile -t detected_domains < <(get_smartlink_domains 2>/dev/null)
         total_sites=${#detected_domains[@]}
         proxy_count=0
+        expired_ssl=0
         for sd in "${detected_domains[@]}"; do
             [ -n "$(get_site_proxy "$sd")" ] && proxy_count=$((proxy_count + 1))
+            [ "$(get_ssl_cert_status "$sd")" == "expired" ] && expired_ssl=$((expired_ssl + 1))
         done
         direct_count=$((total_sites - proxy_count))
 
         echo -e "  ${BLUE}╟──────────────────────────────────────────────╢${NC}"
         printf "  ${BLUE}║${NC}  ${CYAN}Sites:${NC} %-3d ${BLUE}│${NC}  ${GREEN}Proxy:${NC} %-3d ${BLUE}│${NC}  ${YELLOW}Direct:${NC} %-3d      ${BLUE}║${NC}\n" "$total_sites" "$proxy_count" "$direct_count"
+        if [ "$expired_ssl" -gt 0 ]; then
+            echo -e "  ${BLUE}╟──────────────────────────────────────────────╢${NC}"
+            echo -e "  ${BLUE}║${NC}  ${RED}⚠ WARNING: $expired_ssl site(s) have EXPIRED SSL!${NC}     ${BLUE}║${NC}"
+        fi
         echo -e "  ${BLUE}╚══════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${WHITE}1)${NC}  ${CYAN}Install Prerequisites${NC}"
         echo -e "  ${WHITE}2)${NC}  ${CYAN}Add a New Site${NC}"
         echo -e "  ${WHITE}3)${NC}  ${CYAN}List Sites & Status${NC}"
         echo -e "  ${WHITE}4)${NC}  ${CYAN}Delete a Site${NC}"
-        echo -e "  ${WHITE}5)${NC}  ${CYAN}Update Source Code${NC}"
+        echo -e "  ${WHITE}5)${NC}  ${CYAN}Update Source Code${NC} ${DIM}(Auto-renews expired SSL)${NC}"
         echo -e "  ${WHITE}6)${NC}  ${YELLOW}Clear Cache${NC}"
         echo -e "  ${WHITE}7)${NC}  ${YELLOW}Configure Proxy${NC}"
-        echo -e "  ${WHITE}8)${NC}  ${RED}Exit${NC}"
+        echo -e "  ${WHITE}8)${NC}  ${GREEN}Renew SSL Certificates${NC}"
+        echo -e "  ${WHITE}9)${NC}  ${RED}Exit${NC}"
         echo ""
         draw_line
-        read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-8]: " OPTION
+        read -rp "  $(echo -e "${YELLOW}›${NC}") Select an option [1-9]: " OPTION
         draw_line
         echo ""
 
@@ -1157,7 +1568,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             5) update_site ;;
             6) clear_cache ;;
             7) configure_proxy ;;
-            8) echo -e "  ${DIM}Goodbye!${NC}\n"; exit 0 ;;
+            8) renew_ssl_menu ;;
+            9) echo -e "  ${DIM}Goodbye!${NC}\n"; exit 0 ;;
             *) print_err "Invalid option. Please try again." ;;
         esac
 

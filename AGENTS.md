@@ -62,6 +62,12 @@ This document establishes the architecture, network behaviors, security guidelin
 - **Bulk Source Updates**: Supports updating single sites or all SmartLink sites simultaneously. Downloads the GitHub release archive once into a temporary staging area to maximize speed, validates domains, safely replaces source files while strictly preserving existing `cache/` (preventing cache loss for active subscriptions) and restoring `config.php` (`API_DOMAIN`, `APP_DEBUG`, `PROXY_URL`), reloads PHP-FPM OPcache, and enforces standard directory/cache permissions (755 / 777).
 - **Cache & Security Management**: Supports per-site and bulk cache clearing across all domains with live file count detection. Site creation includes HTTP/2 multiplexing, TLS session caching, and hardened security headers (`X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`).
 
+### F. SSL Certificate Lifecycle & Auto-Renewal
+- **Automated Renewal**: Installs a dedicated system cron job (`/etc/cron.d/smartlink-certbot`) running twice daily (03:30 and 15:30) executing `certbot renew` with automated `--pre-hook "systemctl stop nginx"`, `--post-hook "systemctl start nginx"`, and `--deploy-hook "systemctl reload nginx"`, along with activating `certbot.timer`.
+- **Update Auto-Renewal**: Whenever single or bulk source code updates are executed ("Update Source Code" / Option 5), the script automatically checks SSL certificate validity via OpenSSL. If a certificate is expired, expiring within 30 days, or missing, it automatically triggers renewal and reloads Nginx.
+- **Dedicated SSL Management**: Option 8 ("Renew SSL Certificates") allows inspecting live certificate expiration status across all SmartLink domains, renewing expiring/expired certificates, force-renewing individual or all certificates, and verifying the auto-renewal cron daemon.
+- **CLI Direct Execution**: Supports non-interactive invocation via `install.sh --renew-ssl` or `install.sh --update`.
+
 ---
 
 ## 4. Verification & Testing Runbook
