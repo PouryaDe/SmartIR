@@ -2034,9 +2034,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         done
         direct_count=$((total_sites - proxy_count))
 
-        local watchdog_st
         watchdog_st=$(get_watchdog_status)
-        local watchdog_badge
         if [ "$watchdog_st" == "active" ]; then
             watchdog_badge="${GREEN}Active${NC}"
         else
