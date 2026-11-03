@@ -68,6 +68,12 @@ This document establishes the architecture, network behaviors, security guidelin
 - **Dedicated SSL Management**: Option 8 ("Renew SSL Certificates") allows inspecting live certificate expiration status across all SmartLink domains, renewing expiring/expired certificates, force-renewing individual or all certificates, and verifying the auto-renewal cron daemon.
 - **CLI Direct Execution**: Supports non-interactive invocation via `install.sh --renew-ssl` or `install.sh --update`.
 
+### G. Service Management, Self-Healing Watchdog & Resource Optimization
+- **Service Restart**: Option 9 ("Restart Services") provides safe restarts for Nginx, PHP-FPM, or the entire stack. Validates Nginx syntax (`nginx -t`) before issuing restarts to prevent downtime from broken configs.
+- **Self-Healing Watchdog**: Option 10 ("Watchdog & Auto-Healing") installs an automated background watchdog daemon (`/usr/local/bin/smartlink-watchdog.sh`) triggered every minute via `/etc/cron.d/smartlink-watchdog`. Features concurrency locking (`/var/run/smartlink-watchdog.lock`), monitors Nginx and PHP-FPM process states, executes full-stack HTTPS probes against configured SmartLink domains (falling back to local HTTP) to detect deadlocks/502/504 errors and automatically recycles hung workers, monitors critical RAM depletion (< 5%) to drop caches and restart workers, and automatically rotates incident logs in `/var/log/smartlink-watchdog.log`.
+- **Resource-Based Optimization**: Option 11 ("Optimize Server & Nginx Resources") calculates optimal sizing dynamically from hardware specs (CPU cores, total RAM). Sets system file descriptor limits to 65535 (`nofile`), tunes Linux kernel network parameters (`somaxconn`, `tcp_max_syn_backlog`, buffer sizes, `tcp_tw_reuse`, `tcp_fin_timeout`), sizes PHP-FPM workers (`pm.max_children`, `start_servers`, `min/max_spare`) with memory-leak recycling (`pm.max_requests = 1000`) and zombie execution termination (`request_terminate_timeout = 60s`), and configures high-traffic Nginx FastCGI buffer sizes and timeouts to prevent 502 Bad Gateway under burst traffic.
+- **CLI Direct Execution**: Supports non-interactive invocation via `install.sh --restart`, `install.sh --watchdog`, or `install.sh --optimize`.
+
 ---
 
 ## 4. Verification & Testing Runbook
@@ -83,5 +89,5 @@ php -l index.php
 php -l Route.php
 ```
 
-All 90+ unit tests must pass cleanly.
+All 100+ unit tests must pass cleanly.
 
